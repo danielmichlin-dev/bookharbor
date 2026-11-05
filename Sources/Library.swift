@@ -200,9 +200,12 @@ enum BookTimeline {
             if let index = books.firstIndex(where: { $0.identity == identity }) {
                 var book = books[index]
                 book.title = album.title
-                book.plex?.author = album.parentTitle ?? book.plex?.author
-                book.plex?.artwork = album.thumb ?? book.plex?.artwork
-                book.plex?.libraryID = library
+                if var source = book.plex {
+                    source.author = album.parentTitle ?? source.author
+                    source.artwork = album.thumb ?? source.artwork
+                    source.libraryID = library
+                    book.plex = source
+                }
                 books[index] = book
             } else {
                 let source = PlexBookSource(serverID: server, ratingKey: album.ratingKey, author: album.parentTitle,

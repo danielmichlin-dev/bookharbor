@@ -189,14 +189,23 @@ struct PlayerPanel: View {
                     Text("\(player.state.rawValue) | \(audioClock(player.elapsed)) / \(audioClock(player.duration))").font(.caption).monospacedDigit()
                 }
                 Spacer()
-                if book.plex != nil && !book.offline {
-                    Button { shelf.download(book) } label: { Image(systemName: "arrow.down.circle") }.accessibilityLabel("Download for offline listening")
+                if book.plex != nil {
+                    Menu {
+                        BookMenu(book: book, library: shelf.library, shelf: shelf, player: player, downloads: downloads)
+                    } label: { Image(systemName: book.offline ? "checkmark.circle" : "arrow.down.circle") }.accessibilityLabel("Download controls")
                 }
                 Button { chapters = true } label: { Image(systemName: "list.bullet") }.accessibilityLabel("Chapters and tracks")
                     .disabled(player.book?.id != book.id)
                 Button { diagnostics = true } label: { Image(systemName: "stethoscope") }.accessibilityLabel("Playback diagnostics")
             }
             if player.state == .loading || player.state == .buffering { ProgressView() }
+            if let job = downloads.jobs.first(where: { $0.bookID == book.id }) {
+                HStack {
+                    ProgressView(value: downloads.fractions[book.id] ?? 0)
+                    Text(job.state).font(.caption2)
+                    Button("Cancel") { Task { await downloads.cancel(book.id, resumable: false) } }.font(.caption)
+                }
+            }
             if !player.message.isEmpty { Text(player.message).font(.caption).frame(maxWidth: .infinity, alignment: .leading) }
             HStack(spacing: 28) {
                 Button { player.skip(-15) } label: { Image(systemName: "gobackward.15") }
@@ -243,6 +252,7 @@ struct BookDetailsView: View {
     @ObservedObject var player: Player
     @Environment(\.dismiss) private var dismiss
     @State private var deleteImport = false
+    @State private var detailMessage = ""
     var body: some View {
         NavigationStack {
             List {
@@ -256,6 +266,7 @@ struct BookDetailsView: View {
                         if book.plex == nil { Button("Delete imported audio", role: .destructive) { deleteImport = true } }
                     }
                     Section("Chapters") {
+                        if !detailMessage.isEmpty { Text(detailMessage).font(.caption) }
                         let chapters = book.importedChapters ?? book.tracks.enumerated().flatMap { index, track in BookTimeline.chapters(track.chapters ?? [], track: index, duration: track.duration) }
                         if chapters.isEmpty { Text("Chapter information unavailable.") }
                         ForEach(chapters) { chapter in
@@ -269,6 +280,12 @@ struct BookDetailsView: View {
                     }
                 }
             }.navigationTitle("Book details").toolbar { Button("Done") { dismiss() } }
+            .task {
+                guard let book = library.books.first(where: { $0.id == bookID }), book.plex != nil, book.tracks.isEmpty else { return }
+                detailMessage = "Loading chapter and track metadata…"
+                do { _ = try await shelf.plex.resolve(book, library: library); detailMessage = "" }
+                catch { detailMessage = (error as? PlexError)?.errorDescription ?? "Track metadata is not available. Retry when connected." }
+            }
             .alert("Delete imported audio and its position?", isPresented: $deleteImport) {
                 Button("Delete", role: .destructive) {
                     if let book = library.books.first(where: { $0.id == bookID }) { Task { await shelf.removeDownload(book); dismiss() } }
