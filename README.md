@@ -21,20 +21,19 @@ The previous version built an unsigned IPA and installed with Sideloadly. MP3 im
 
 ## Validation
 
-The revised macOS run passed simulator tests and built an unsigned device IPA using free ad-hoc signing only for the simulator test host. Final security/lifecycle changes are awaiting another run; do not use the intermediate preview IPA. Synthetic XCTest coverage includes Plex parsing/order, malformed chapter timing, multipart navigation, URL/authentication policy, redirect rejection, HTTP/size/MIME completion failures, legacy-index migration, Keychain roundtrip and two independent book positions after relaunch (including rewind, metadata edit, and download-state changes).
+Final [GitHub Actions run 41955563692](https://github.com/danielmichlin-dev/bookharbor/actions/runs/41955563692) passed all 13 simulator tests with zero failures and compiled/packaged the unsigned iPhone IPA on macOS-15. The downloaded IPA was inspected: version 0.2.0/build 2, original bundle identifier org.example.bookharbor, audio background mode, no ATS exception, no bundled media/runtime library/test bundle/provisioning profile, and no code signature. Simulator tests use free ad-hoc signing; the deliverable IPA is unsigned. New Plex/device behavior remains unverified on a real iPhone. Synthetic XCTest coverage includes Plex parsing/order, malformed chapter timing, multipart navigation, URL/authentication policy, redirect rejection, HTTP/size/MIME completion failures, legacy-index migration, Keychain roundtrip and two independent book positions after relaunch (including rewind, metadata edit, and download-state changes).
 
 Tests do not substitute for real background transfers, embedded chapter extraction across formats, TLS/server compatibility or iPhone audio routing. No private credentials, media or library fixtures are used in CI. The standard macOS runner builds an unsigned device IPA after simulator tests; artifact retention is one day. No paid service or Apple membership is required by the build.
 
 ## Install / update on Windows
 
-Use GitHub CLI in PowerShell (artifact expires after one day):
+Use GitHub CLI in PowerShell (artifact expires after one day). Download this verified build:
 
 ```powershell
-$runId = gh run list --repo danielmichlin-dev/bookharbor --workflow build.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId'
-gh run download $runId --repo danielmichlin-dev/bookharbor --name BookHarbor-unsigned --dir .\build\latest-ipa
+gh run download 41955563692 --repo danielmichlin-dev/bookharbor --name BookHarbor-unsigned --dir .\build\ipa-41955563692
 ```
 
-Open `build\latest-ipa\BookHarbor-unsigned.ipa` in Sideloadly. Connect and trust the iPhone. Use the **same Apple Account and the same Sideloadly app/bundle identifier used for the installed copy**, and install over it. Source bundle identity remains `org.example.bookharbor`; preserve any identifier Sideloadly previously assigned. **Do not uninstall.** Verify the existing imported file and progress afterward. Free signing needs periodic renewal (normally seven days); an expired app cannot open even with offline media. See WINDOWS_SETUP.md for initial setup.
+Open `build\ipa-41955563692\BookHarbor-unsigned.ipa` in Sideloadly. Connect and trust the iPhone. Use the **same Apple Account and the same Sideloadly app/bundle identifier used for the installed copy**, and install over it. Source bundle identity remains `org.example.bookharbor`; preserve any identifier Sideloadly previously assigned. **Do not uninstall.** Verify the existing imported file and progress afterward. Free signing needs periodic renewal (normally seven days); an expired app cannot open even with offline media. See WINDOWS_SETUP.md for initial setup.
 
 ## Real-iPhone checklist
 
@@ -49,7 +48,7 @@ Open `build\latest-ipa\BookHarbor-unsigned.ipa` in Sideloadly. Connect and trust
 
 ## Deferred
 
-Unattended background downloads (blocked by the redirect/authentication constraint), Plex progress sync, automatic reconnection/failover during a stream, transcoding, bookmarks, external metadata search/candidate selection, manual metadata/cover editing, and external edition-matched chapter lookup. See METADATA_PLAN.md for provider research and privacy rules. No metadata provider requests are currently made. Large Files imports still copy synchronously as in the verified starter.
+Unattended background downloads (blocked by the redirect/authentication constraint), Plex progress sync, automatic reconnection/failover during a stream, transcoding, bookmarks, external metadata search/candidate selection, manual metadata/cover editing, and external edition-matched chapter lookup. PIN linking currently uses Plex's documented legacy token flow; short-lived JWT migration/refresh is deferred. See METADATA_PLAN.md for provider research and privacy rules. No metadata provider requests are currently made. Large Files imports still copy synchronously as in the verified starter.
 
 ## References
 

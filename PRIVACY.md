@@ -22,7 +22,7 @@ folder. No credentials are stored in the local JSON index or UserDefaults.
 Only HTTPS connections returned by authenticated Plex resource discovery are eligible.
 The selected server must match its discovered machine identity. System TLS certificate
 validation remains enabled, HTTP connections are unsupported, and no ATS exception is
-added. Tokens are request headers, never URL parameters. Every network session rejects
+added. Tokens are request headers, never URL parameters. Every session carrying authentication rejects
 redirects; server-supplied media/artwork keys must be root-relative paths on the selected
 origin. AVPlayer's custom resource loader sends authenticated, bounded range requests;
 AVFoundation never receives a token-bearing network URL. Underlying errors/responses
