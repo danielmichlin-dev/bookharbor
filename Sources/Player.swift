@@ -15,6 +15,7 @@ import Combine
     private var resource: MediaResource?
     private var openGeneration = UUID()
     private var seeking = false
+    private var wantsPlayback = false
     private var trackOffset: Double = 0
     var plex: PlexClient?
     private let engine = AVPlayer()
@@ -31,7 +32,9 @@ import Combine
             Task { @MainActor in
                 guard let self else { return }
                 guard !self.seeking else { return }
-                self.trackOffset = time.seconds.isFinite ? time.seconds : 0
+                let current = self.engine.currentTime().seconds
+                guard self.engine.currentItem?.status == .readyToPlay else { return }
+                self.trackOffset = current.isFinite ? current : 0
                 self.elapsed = BookTimeline.absolute(track: self.trackIndex, offset: self.trackOffset, tracks: self.book?.tracks ?? [])
                 let length = self.engine.currentItem?.duration.seconds ?? 0
                 self.duration = self.book?.plex != nil ? (self.book?.tracks.reduce(0) { $0 + $1.duration } ?? 0) : (length.isFinite ? length : 0)
@@ -78,7 +81,7 @@ import Combine
             }
         })
     }
-    func open(_ next: Book) {
+    func open(_ next: Book, autoplay: Bool = true) {
         pause()
         let latest = library.books.first(where: { $0.id == next.id }) ?? next
         book = latest
@@ -92,10 +95,13 @@ import Combine
         // Prefer the explicit file/offset checkpoint; total seconds remains for v0.1 imports.
         let checkpoint = latest.progress
         let index = checkpoint?.trackID.flatMap { id in latest.tracks.firstIndex(where: { $0.id == id }) } ?? location.0
-        loadTrack(index, offset: checkpoint?.offset ?? location.1, autoplay: true)
+        loadTrack(index, offset: checkpoint?.offset ?? location.1, autoplay: autoplay)
     }
     private func loadTrack(_ index: Int, offset: Double, autoplay: Bool) {
-        guard let book else { return }
+        guard let currentBook = book else { return }
+        let book = library.books.first(where: { $0.id == currentBook.id }) ?? currentBook
+        self.book = book
+        wantsPlayback = autoplay
         engine.pause(); resource?.cancel(); resource = nil
         openGeneration = UUID(); let generation = openGeneration
         seeking = true; trackIndex = index; trackOffset = offset
@@ -131,12 +137,13 @@ import Combine
             let ok = await self.engine.seek(to: CMTime(seconds: offset, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
             guard self.openGeneration == generation else { return }
             self.seeking = false
-            if ok && autoplay { self.play() }
+            if ok && self.wantsPlayback { self.play() }
             await self.readChapters(asset, bookID: book.id, track: index, generation: generation)
         }
     }
     func play() {
         guard book != nil else { return }
+        wantsPlayback = true
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
             try AVAudioSession.sharedInstance().setActive(true)
@@ -146,6 +153,7 @@ import Combine
         } catch { message = "Could not start audio playback." }
     }
     func pause() {
+        wantsPlayback = false
         engine.pause(); playing = false; save(); nowPlaying()
     }
     func skip(_ seconds: Double) {
@@ -155,22 +163,34 @@ import Combine
     func changeSpeed(_ value: Float) { speed = value; if playing { engine.rate = value }; nowPlaying() }
     func save() {
         if let book {
+            if !seeking, engine.currentItem?.status == .readyToPlay {
+                let time = engine.currentTime().seconds
+                if time.isFinite {
+                    trackOffset = max(0, time)
+                    elapsed = BookTimeline.absolute(track: trackIndex, offset: trackOffset, tracks: book.tracks)
+                }
+            }
             let chapter = chapters.last(where: { $0.trackIndex == trackIndex && trackOffset >= $0.start && trackOffset < $0.end })
             library.record(book.id, position: elapsed, track: trackIndex, offset: trackOffset, chapter: chapter?.id)
         }
     }
     func seek(_ target: Double) {
         guard let book else { return }
-        let wasPlaying = playing
+        let wasPlaying = wantsPlayback
         let location = BookTimeline.location(max(0, target), tracks: book.tracks)
         if location.0 != trackIndex {
             loadTrack(location.0, offset: location.1, autoplay: wasPlaying)
             save()
         } else {
             seeking = true; elapsed = target; trackOffset = location.1; save()
+            openGeneration = UUID()
             let generation = openGeneration
             engine.seek(to: CMTime(seconds: location.1, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-                Task { @MainActor in if self?.openGeneration == generation { self?.seeking = false } }
+                Task { @MainActor in
+                    guard let self, self.openGeneration == generation else { return }
+                    self.seeking = false
+                    if wasPlaying && self.wantsPlayback { self.play() }
+                }
             }
         }
         nowPlaying()
@@ -182,21 +202,14 @@ import Combine
         chapters.last(where: { $0.trackIndex == trackIndex && trackOffset >= $0.start && trackOffset < $0.end })?.id
     }
     func stopStreaming() {
-        if book?.plex != nil && book?.offline == false { pause(); resource?.cancel(); engine.replaceCurrentItem(with: nil); book = nil }
+        if book?.plex != nil && resource != nil {
+            pause(); openGeneration = UUID(); resource?.cancel(); resource = nil
+            engine.replaceCurrentItem(with: nil); book = nil
+        }
     }
     private func readChapters(_ asset: AVURLAsset, bookID: UUID, track: Int, generation: UUID) async {
         do {
-            let locales = try await asset.load(.availableChapterLocales)
-            guard let locale = locales.first else { return }
-            let groups = try await asset.loadChapterMetadataGroups(withTitleLocale: locale, containingItemsWithCommonKeys: [.commonKeyTitle])
-            var found: [BookChapter] = []
-            for (index, group) in groups.enumerated() {
-                let start = group.timeRange.start.seconds
-                let end = CMTimeRangeGetEnd(group.timeRange).seconds
-                guard start.isFinite, end.isFinite, start >= 0, end > start else { continue }
-                let title = try await group.items.first?.load(.stringValue)
-                found.append(BookChapter(id: "\(track):\(start)", title: title ?? "Chapter \(index + 1)", trackIndex: track, start: start, end: end))
-            }
+            let found = try await ChapterReader.read(asset, track: track)
             guard generation == openGeneration, !found.isEmpty else { return }
             chapters.removeAll { $0.trackIndex == track }; chapters += found
             chapters.sort { $0.trackIndex == $1.trackIndex ? $0.start < $1.start : $0.trackIndex < $1.trackIndex }

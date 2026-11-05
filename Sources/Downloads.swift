@@ -9,7 +9,7 @@ struct DownloadJob: Codable, Identifiable {
     var track: Int
     var tag: String
     var state: String
-    var resumeFile: String?
+    var resumeKey: String?
 }
 
 @MainActor final class Downloads: NSObject, ObservableObject, URLSessionDownloadDelegate {
@@ -58,6 +58,7 @@ struct DownloadJob: Codable, Identifiable {
         for index in jobs.indices where jobs[index].state == "Downloading" {
             if !tasks.contains(where: { $0.taskDescription == jobs[index].tag }) { jobs[index].state = "Interrupted — retry" }
         }
+        jobs.removeAll { job in library.books.first(where: { $0.id == job.bookID })?.offline == true }
         ready = true; persist()
     }
     func start(_ book: Book) {
@@ -67,7 +68,7 @@ struct DownloadJob: Codable, Identifiable {
         guard let track = source.tracks.firstIndex(where: { $0.filename == nil }) else { return }
         let previous = jobs.first(where: { $0.bookID == book.id })
         jobs.removeAll { $0.bookID == book.id }
-        jobs.append(DownloadJob(bookID: book.id, track: track, tag: UUID().uuidString, state: "Preparing", resumeFile: previous?.resumeFile))
+        jobs.append(DownloadJob(bookID: book.id, track: track, tag: UUID().uuidString, state: "Preparing", resumeKey: previous?.resumeKey))
         schedule(book.id)
     }
     private func schedule(_ id: UUID) {
@@ -81,12 +82,12 @@ struct DownloadJob: Codable, Identifiable {
             guard available > remaining + source.tracks[jobs[index].track].bytes + 32 * 1024 * 1024 else { throw PlexError.storage }
             let request = try plex.mediaRequest(source: source, track: source.tracks[jobs[index].track])
             let task: URLSessionDownloadTask
-            if let file = jobs[index].resumeFile, let data = try? Data(contentsOf: root.appendingPathComponent(file)),
+            if let file = jobs[index].resumeKey, let data = Data(base64Encoded: SecureSettings.read(file)),
                Self.resumeMatches(data, request: request) {
                 task = session.downloadTask(withResumeData: data)
             } else { task = session.downloadTask(with: request) }
-            if let file = jobs[index].resumeFile { try? FileManager.default.removeItem(at: root.appendingPathComponent(file)) }
-            jobs[index].resumeFile = nil
+            if let file = jobs[index].resumeKey { try? SecureSettings.write("", key: file) }
+            jobs[index].resumeKey = nil
             jobs[index].state = "Downloading"
             task.taskDescription = jobs[index].tag
             persist(); task.resume()
@@ -107,8 +108,8 @@ struct DownloadJob: Codable, Identifiable {
         let tag = jobs[index].tag
         jobs[index].tag = UUID().uuidString // Ignore late completion and validation callbacks.
         jobs[index].state = resumable ? "Paused — retry to resume" : "Cancelled"
-        if !resumable, let file = jobs[index].resumeFile {
-            try? FileManager.default.removeItem(at: root.appendingPathComponent(file)); jobs[index].resumeFile = nil
+        if !resumable, let file = jobs[index].resumeKey {
+            try? SecureSettings.write("", key: file); jobs[index].resumeKey = nil
         }
         let replacement = jobs[index].tag
         persist()
@@ -116,10 +117,10 @@ struct DownloadJob: Codable, Identifiable {
             if resumable, let download = task as? URLSessionDownloadTask {
                 let data = await download.cancelByProducingResumeData()
                 if let data, let current = jobs.firstIndex(where: { $0.bookID == id && $0.tag == replacement }) {
-                    let file = "resume-" + UUID().uuidString
+                    let file = "plex-resume-" + UUID().uuidString
                     do {
-                        try data.write(to: root.appendingPathComponent(file), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-                        jobs[current].resumeFile = file
+                        try SecureSettings.write(data.base64EncodedString(), key: file)
+                        jobs[current].resumeKey = file
                     } catch { message = "Resume data could not be saved. Retry will start this track again." }
                 }
             } else { task.cancel() }
@@ -153,7 +154,7 @@ struct DownloadJob: Codable, Identifiable {
             validating -= 1
             completeEventsIfReady()
         }
-        guard let job = jobs.first(where: { $0.tag == tag && $0.state == "Downloading" }),
+        guard let job = jobs.first(where: { $0.tag == tag }),
               let book = library.books.first(where: { $0.id == job.bookID }),
               let source = book.plex, source.tracks.indices.contains(job.track) else { return }
         let track = source.tracks[job.track]
@@ -163,10 +164,24 @@ struct DownloadJob: Codable, Identifiable {
             let asset = AVURLAsset(url: staged)
             let audio = try await asset.loadTracks(withMediaType: .audio)
             guard !audio.isEmpty else { throw PlexError.incomplete }
-            guard let index = jobs.firstIndex(where: { $0.tag == tag && $0.state == "Downloading" }) else { return }
+            let embedded = (try? await ChapterReader.read(asset, track: job.track)) ?? []
+            guard let index = jobs.firstIndex(where: { $0.tag == tag }) else { return }
             let file = UUID().uuidString + "." + track.ext
             try FileManager.default.moveItem(at: staged, to: root.appendingPathComponent(file))
-            library.update(book.id) { $0.plex?.tracks[job.track].filename = file }
+            guard library.update(book.id, { current in
+                current.plex?.tracks[job.track].filename = file
+                if !embedded.isEmpty {
+                    var chapters = current.importedChapters ?? current.tracks.enumerated().flatMap { index, track in
+                        BookTimeline.chapters(track.chapters ?? [], track: index, duration: track.duration)
+                    }
+                    chapters.removeAll { $0.trackIndex == job.track }
+                    chapters += embedded
+                    current.importedChapters = chapters.sorted { $0.trackIndex == $1.trackIndex ? $0.start < $1.start : $0.trackIndex < $1.trackIndex }
+                }
+            }) else {
+                try? FileManager.default.removeItem(at: root.appendingPathComponent(file))
+                throw PlexError.storage
+            }
             if let next = library.books.first(where: { $0.id == book.id })?.tracks.firstIndex(where: { $0.filename == nil }) {
                 jobs[index].track = next; jobs[index].tag = UUID().uuidString
                 persist(); schedule(book.id)
@@ -188,9 +203,9 @@ struct DownloadJob: Codable, Identifiable {
         Task { @MainActor in
             guard let index = self.jobs.firstIndex(where: { $0.tag == tag }) else { return }
             if let resume {
-                let file = "resume-" + UUID().uuidString
-                if (try? resume.write(to: self.root.appendingPathComponent(file), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])) != nil {
-                    self.jobs[index].resumeFile = file
+                let file = "plex-resume-" + UUID().uuidString
+                if (try? SecureSettings.write(resume.base64EncodedString(), key: file)) != nil {
+                    self.jobs[index].resumeKey = file
                 }
             }
             self.fail(tag, error: PlexError.unavailable)

@@ -61,6 +61,7 @@ enum BookTimeline {
     @Published var books: [Book] = []
     @Published var message = ""
     let root: URL
+    private var canWrite = true
     init(root supplied: URL? = nil) {
         root = supplied ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Books", isDirectory: true)
@@ -74,16 +75,22 @@ enum BookTimeline {
             if FileManager.default.fileExists(atPath: index.path) {
                 books = try JSONDecoder().decode([Book].self, from: Data(contentsOf: index))
             }
-        } catch { message = "Could not load the local library. Your files have not been deleted." }
+        } catch {
+            canWrite = false
+            message = "Could not load the local library. Your files have not been deleted. Reopen after unlocking; writes are disabled to protect your index."
+        }
     }
     func url(for book: Book) -> URL { root.appendingPathComponent(book.filename) }
-    func save() {
+    @discardableResult func save() -> Bool {
+        guard canWrite else { return false }
         do {
             let data = try JSONEncoder().encode(books)
             try data.write(to: root.appendingPathComponent("index.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-        } catch { message = "Could not save your listening progress. Check available storage." }
+            return true
+        } catch { message = "Could not save your listening progress. Check available storage."; return false }
     }
     func importFile(_ source: URL) {
+        guard canWrite else { return }
         let access = source.startAccessingSecurityScopedResource()
         defer { if access { source.stopAccessingSecurityScopedResource() } }
         let ext = source.pathExtension.lowercased()
@@ -104,13 +111,14 @@ enum BookTimeline {
         }
     }
     func record(_ id: UUID, position: Double, track: Int = 0, offset: Double? = nil, chapter: String? = nil) {
-        guard position.isFinite, let index = books.firstIndex(where: { $0.id == id }) else { return }
+        guard canWrite, position.isFinite, offset?.isFinite != false, let index = books.firstIndex(where: { $0.id == id }) else { return }
         books[index].position = max(0, position)
         books[index].progress = ListeningProgress(trackID: books[index].tracks.indices.contains(track) ? books[index].tracks[track].id : nil,
             trackIndex: track, offset: max(0, offset ?? position), chapterID: chapter, updatedAt: Date())
         save()
     }
     func remove(_ book: Book) {
+        guard canWrite else { return }
         do {
             if book.plex != nil {
                 for track in book.tracks { if let file = track.filename { try? FileManager.default.removeItem(at: root.appendingPathComponent(file)) } }
@@ -124,21 +132,30 @@ enum BookTimeline {
             save()
         } catch { message = "Could not delete this book." }
     }
-    func upsert(title: String, source: PlexBookSource) -> Book {
+    func upsert(title: String, source: PlexBookSource) throws -> Book {
+        guard canWrite else { throw PlexError.storage }
         if let existing = books.first(where: { $0.identity == source.identity }) { return existing }
         let book = Book(id: UUID(), title: title, filename: "", plex: source)
-        books.append(book); save(); return book
+        books.append(book)
+        guard save() else { books.removeLast(); throw PlexError.storage }
+        return book
     }
-    func update(_ id: UUID, _ edit: (inout Book) -> Void) {
-        guard let index = books.firstIndex(where: { $0.id == id }) else { return }
-        edit(&books[index]); save()
+    @discardableResult func update(_ id: UUID, _ edit: (inout Book) -> Void) -> Bool {
+        guard canWrite, let index = books.firstIndex(where: { $0.id == id }) else { return false }
+        let old = books[index]
+        edit(&books[index])
+        guard save() else { books[index] = old; return false }
+        return true
     }
     var storageBytes: Int64 {
-        books.reduce(0) { sum, book in
+        var total: Int64 = 0
+        for book in books {
             let files = book.plex == nil ? [book.filename] : book.tracks.compactMap(\.filename)
-            return sum + files.reduce(0) { count, file in
-                count + ((try? FileManager.default.attributesOfItem(atPath: root.appendingPathComponent(file).path)[.size] as? NSNumber)?.int64Value ?? 0)
+            for file in files {
+                let attributes = try? FileManager.default.attributesOfItem(atPath: root.appendingPathComponent(file).path)
+                total += (attributes?[.size] as? NSNumber)?.int64Value ?? 0
             }
         }
+        return total
     }
 }

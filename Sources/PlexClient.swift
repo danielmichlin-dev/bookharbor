@@ -188,7 +188,7 @@ final class PlexTransport {
                                    artwork: album.thumb, tracks: tracks)
         // Validate every media path before storing metadata or scheduling work.
         for track in tracks { _ = try mediaRequest(source: source, track: track) }
-        return library.upsert(title: album.title, source: source)
+        return try library.upsert(title: album.title, source: source)
     }
     func mediaRequest(source: PlexBookSource, track: BookTrack) throws -> URLRequest {
         try request(track.key, server: source.serverID)

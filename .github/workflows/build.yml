@@ -25,7 +25,7 @@ jobs:
       - name: Test synthetic parsing, security, downloads and persistence
         run: |
           SIMULATOR_ID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(v["udid"] for k,items in d["devices"].items() if "iOS" in k for v in items if v["name"].startswith("iPhone")))')
-          xcodebuild -project BookHarbor.xcodeproj -scheme BookHarbor -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -derivedDataPath build-tests CODE_SIGNING_ALLOWED=NO test
+          xcodebuild -project BookHarbor.xcodeproj -scheme BookHarbor -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -parallel-testing-enabled NO -derivedDataPath build-tests CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- test
       - name: Compile unsigned device app
         run: xcodebuild -project BookHarbor.xcodeproj -scheme BookHarbor -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
       - name: Package for local signing
