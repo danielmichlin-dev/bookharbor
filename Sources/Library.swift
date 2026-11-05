@@ -12,8 +12,34 @@ struct Book: Identifiable, Codable {
     var artworkFile: String?
     var importedChapters: [BookChapter]?
     var identity: String { plex?.identity ?? id.uuidString }
-    var offline: Bool { plex == nil || plex?.tracks.allSatisfy { $0.filename != nil } == true }
+    var offline: Bool { plex == nil || (!tracks.isEmpty && tracks.allSatisfy { $0.filename != nil }) }
     var tracks: [BookTrack] { plex?.tracks ?? [] }
+    var totalDuration: Double { tracks.reduce(0) { $0 + $1.duration } }
+    var hasPartialDownload: Bool { !offline && tracks.contains { $0.filename != nil } }
+}
+
+struct ShelfSelection: Codable, Equatable {
+    var serverID: String
+    var libraryID: String
+}
+
+enum PlaybackSourceChoice: Equatable { case imported, downloaded, streaming, unresolved }
+enum Bookshelf {
+    static func source(for book: Book) -> PlaybackSourceChoice {
+        if book.plex == nil { return .imported }
+        if book.tracks.isEmpty { return .unresolved }
+        return book.offline ? .downloaded : .streaming
+    }
+    static func filtered(_ books: [Book], query: String, selection: ShelfSelection?, scope: String) -> [Book] {
+        books.filter { book in
+            let matches = query.isEmpty || book.title.localizedCaseInsensitiveContains(query) || (book.plex?.author?.localizedCaseInsensitiveContains(query) == true)
+            guard matches else { return false }
+            if scope == "Downloads" { return book.offline && book.plex != nil }
+            if scope == "Imports" { return book.plex == nil }
+            guard let selection, let source = book.plex else { return true }
+            return source.serverID == selection.serverID && (source.libraryID == nil || source.libraryID == selection.libraryID)
+        }
+    }
 }
 
 struct ListeningProgress: Codable {
@@ -60,6 +86,7 @@ enum BookTimeline {
 @MainActor final class Library: ObservableObject {
     @Published var books: [Book] = []
     @Published var message = ""
+    @Published private(set) var selection: ShelfSelection?
     let root: URL
     private var canWrite = true
     init(root supplied: URL? = nil) {
@@ -78,6 +105,9 @@ enum BookTimeline {
         } catch {
             canWrite = false
             message = "Could not load the local library. Your files have not been deleted. Reopen after unlocking; writes are disabled to protect your index."
+        }
+        if let data = try? Data(contentsOf: root.appendingPathComponent("shelf.json")) {
+            selection = try? JSONDecoder().decode(ShelfSelection.self, from: data)
         }
     }
     func url(for book: Book) -> URL { root.appendingPathComponent(book.filename) }
@@ -134,11 +164,53 @@ enum BookTimeline {
     }
     func upsert(title: String, source: PlexBookSource) throws -> Book {
         guard canWrite else { throw PlexError.storage }
-        if let existing = books.first(where: { $0.identity == source.identity }) { return existing }
+        if let existing = books.first(where: { $0.identity == source.identity }) {
+            // Album refreshes contain no tracks; resolved tracks may be refreshed
+            // without losing filenames, precise progress, chapters or completion.
+            var merged = source
+            if source.tracks.isEmpty || existing.offline { merged.tracks = existing.tracks }
+            else {
+                for index in merged.tracks.indices {
+                    if let old = existing.tracks.first(where: { $0.id == merged.tracks[index].id }),
+                       old.key == merged.tracks[index].key, old.bytes == merged.tracks[index].bytes {
+                        merged.tracks[index].filename = old.filename
+                        if merged.tracks[index].chapters == nil { merged.tracks[index].chapters = old.chapters }
+                    }
+                }
+            }
+            merged.libraryID = source.libraryID ?? existing.plex?.libraryID
+            guard update(existing.id, { book in book.title = title; book.plex = merged }) else { throw PlexError.storage }
+            return books.first { $0.id == existing.id }!
+        }
         let book = Book(id: UUID(), title: title, filename: "", plex: source)
         books.append(book)
         guard save() else { books.removeLast(); throw PlexError.storage }
         return book
+    }
+    func selectShelf(_ value: ShelfSelection) throws {
+        guard canWrite else { throw PlexError.storage }
+        try JSONEncoder().encode(value).write(to: root.appendingPathComponent("shelf.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        selection = value
+    }
+    func mergeAlbums(_ albums: [PlexMetadata], server: String, library: String) throws {
+        // One atomic write per page, not per book. No audio/track requests here.
+        let previous = books
+        for album in albums {
+            let identity = server + ":" + album.ratingKey
+            if let index = books.firstIndex(where: { $0.identity == identity }) {
+                var book = books[index]
+                book.title = album.title
+                book.plex?.author = album.parentTitle ?? book.plex?.author
+                book.plex?.artwork = album.thumb ?? book.plex?.artwork
+                book.plex?.libraryID = library
+                books[index] = book
+            } else {
+                let source = PlexBookSource(serverID: server, ratingKey: album.ratingKey, author: album.parentTitle,
+                    artwork: album.thumb, tracks: [], libraryID: library)
+                books.append(Book(id: UUID(), title: album.title, filename: "", plex: source))
+            }
+        }
+        guard save() else { books = previous; throw PlexError.storage }
     }
     @discardableResult func update(_ id: UUID, _ edit: (inout Book) -> Void) -> Bool {
         guard canWrite, let index = books.firstIndex(where: { $0.id == id }) else { return false }

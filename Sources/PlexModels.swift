@@ -2,6 +2,7 @@ import Foundation
 
 enum PlexError: Error, LocalizedError {
     case unsafeURL, authentication, unavailable, malformed, incomplete, storage, unsupported
+    case http(Int), network(Int), range, preparation, seekFailed
     var errorDescription: String? {
         switch self {
         case .unsafeURL: return "This connection or media address is not permitted. Use a discovered HTTPS connection. Redirects are blocked."
@@ -11,6 +12,14 @@ enum PlexError: Error, LocalizedError {
         case .incomplete: return "The download was incomplete or was not an audio file. Retry to continue."
         case .storage: return "Not enough available storage for this book. Delete a local download and retry."
         case .unsupported: return "This book has no compatible original audio. Transcoding is not enabled."
+        case .http(let code):
+            if [401, 403, 498].contains(code) { return "Plex rejected authorization or access (HTTP \(code)). Link again or check server permissions. Downloaded books remain available." }
+            if (300...399).contains(code) { return "The media request was redirected (HTTP \(code)). The redirect was blocked to protect your credentials." }
+            return "Plex media request failed (HTTP \(code)). Check server availability and original-media access."
+        case .network: return "A connection is needed for this book. Check your network and Plex server, or choose a completed download."
+        case .range: return "Plex returned an invalid or inconsistent byte range. Open Playback diagnostics and report the stage and numeric codes only."
+        case .preparation: return "The audio did not become ready. Check the connection or media format, then retry. Playback diagnostics shows the last completed stage."
+        case .seekFailed: return "The saved position could not be restored. Retry playback or use Restart from beginning. Your saved position is preserved."
         }
     }
 }
@@ -125,6 +134,7 @@ struct PlexBookSource: Codable {
     var artwork: String?
     var tracks: [BookTrack]
     var identity: String { serverID + ":" + ratingKey }
+    var libraryID: String?
 }
 
 enum PlexBooks {

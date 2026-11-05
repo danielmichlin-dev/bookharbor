@@ -3,6 +3,14 @@ import MediaPlayer
 import Combine
 
 @MainActor final class Player: ObservableObject {
+    @Published var state: PlaybackState = .idle
+    let diagnostics = PlaybackDiagnostics()
+    private var preparation = PlaybackPreparation(offset: 0)
+    private var preparationTimeout: Task<Void, Never>?
+    private var timeControlObserver: NSKeyValueObservation?
+    private var seekToken = UUID()
+    private let remoteRequest: ((PlexBookSource, BookTrack) throws -> URLRequest)?
+    private let fetch: MediaResource.Fetch?
     @Published var book: Book?
     @Published var playing = false
     @Published var elapsed: Double = 0
@@ -26,8 +34,12 @@ import Combine
     private var ticks = 0
     let library: Library
 
-    init(library: Library) {
-        self.library = library
+    init(library: Library, remoteRequest: ((PlexBookSource, BookTrack) throws -> URLRequest)? = nil,
+         fetch: MediaResource.Fetch? = nil) {
+        self.library = library; self.remoteRequest = remoteRequest; self.fetch = fetch
+        timeControlObserver = engine.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in self?.updatePlaybackState() }
+        }
         observer = engine.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1, preferredTimescale: 600), queue: .main) { [weak self] time in
             Task { @MainActor in
                 guard let self else { return }
@@ -38,7 +50,7 @@ import Combine
                 self.elapsed = BookTimeline.absolute(track: self.trackIndex, offset: self.trackOffset, tracks: self.book?.tracks ?? [])
                 let length = self.engine.currentItem?.duration.seconds ?? 0
                 self.duration = self.book?.plex != nil ? (self.book?.tracks.reduce(0) { $0 + $1.duration } ?? 0) : (length.isFinite ? length : 0)
-                self.playing = self.engine.rate != 0
+                self.updatePlaybackState()
                 self.ticks += 1
                 if self.ticks % 5 == 0 { self.save() }
                 self.nowPlaying()
@@ -81,8 +93,14 @@ import Combine
             }
         })
     }
-    func open(_ next: Book, autoplay: Bool = true) {
+    func prepareSelection() {
+        close(); diagnostics.clear(); message = ""; state = .loading
+        diagnostics.record(.selection, .started)
+    }
+    func failSelection(_ error: Error) { fail((error as? PlexError) ?? .unavailable) }
+    func open(_ next: Book, autoplay: Bool = true, resetDiagnostics: Bool = true) {
         pause()
+        if resetDiagnostics { diagnostics.clear(); diagnostics.record(.selection, .started) }
         let latest = library.books.first(where: { $0.id == next.id }) ?? next
         book = latest
         elapsed = latest.position
@@ -102,8 +120,11 @@ import Combine
         let book = library.books.first(where: { $0.id == currentBook.id }) ?? currentBook
         self.book = book
         wantsPlayback = autoplay
-        engine.pause(); resource?.cancel(); resource = nil
+        engine.pause(); engine.replaceCurrentItem(with: nil); resource?.cancel(); resource = nil
         openGeneration = UUID(); let generation = openGeneration
+        preparationTimeout?.cancel()
+        preparation = PlaybackPreparation(offset: offset)
+        state = .loading; playing = false
         seeking = true; trackIndex = index; trackOffset = offset
         elapsed = BookTimeline.absolute(track: index, offset: offset, tracks: book.tracks)
         let asset: AVURLAsset
@@ -111,50 +132,128 @@ import Combine
             if let source = book.plex {
                 guard source.tracks.indices.contains(index) else { throw PlexError.malformed }
                 let track = source.tracks[index]
-                if let filename = track.filename {
+                if Bookshelf.source(for: book) == .downloaded, let filename = track.filename,
+                   FileManager.default.fileExists(atPath: library.root.appendingPathComponent(filename).path) {
+                    diagnostics.record(.source, .local)
                     asset = AVURLAsset(url: library.root.appendingPathComponent(filename))
                 } else {
-                    guard let plex else { throw PlexError.authentication }
-                    let loader = MediaResource(request: try plex.mediaRequest(source: source, track: track), bytes: track.bytes, ext: track.ext)
+                    diagnostics.record(.connection, .started)
+                    let request: URLRequest
+                    if let remoteRequest { request = try remoteRequest(source, track) }
+                    else {
+                        guard let plex else { throw PlexError.authentication }
+                        request = try plex.mediaRequest(source: source, track: track)
+                    }
+                    diagnostics.record(.authentication, .started)
+                    let loader = MediaResource(request: request, bytes: track.bytes, ext: track.ext,
+                        fetch: fetch ?? { try await PlexTransport.shared.data($0, limit: $1) })
+                    loader.event = { [weak self] stage, fact, code in
+                        guard let self, self.openGeneration == generation else { return }
+                        self.diagnostics.record(stage, fact, code: code)
+                        if stage == .http && code == 206 { self.diagnostics.record(.authentication, .ready) }
+                    }
+                    loader.failure = { [weak self] error in
+                        guard let self, self.openGeneration == generation else { return }
+                        self.fail(error)
+                    }
+                    diagnostics.record(.source, .streaming)
                     resource = loader; asset = loader.asset
                 }
-            } else { asset = AVURLAsset(url: library.url(for: book)) }
-        } catch {
-            seeking = false; playing = false
-            message = (error as? PlexError)?.errorDescription ?? "Could not open this book."; return
-        }
+            } else {
+                diagnostics.record(.source, .local)
+                asset = AVURLAsset(url: library.url(for: book))
+            }
+        } catch { fail((error as? PlexError) ?? .unavailable); return }
+
+        diagnostics.record(.item, .started)
         let item = AVPlayerItem(asset: asset)
         engine.replaceCurrentItem(with: item)
-        statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            let failed = item.status == .failed
-            if failed { Task { @MainActor in
-                self?.message = "This file could not be played. Try a compatible, unprotected audio file."
-                self?.pause()
-            } }
+        statusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            Task { @MainActor in
+                guard let self, self.openGeneration == generation, self.engine.currentItem === item else { return }
+                switch item.status {
+                case .readyToPlay:
+                    guard let offset = self.preparation.becameReady() else { return }
+                    self.diagnostics.record(.readiness, .ready)
+                    self.restore(offset, generation: generation)
+                    Task { await self.readChapters(asset, bookID: book.id, track: index, generation: generation) }
+                case .failed:
+                    self.diagnostics.record(.item, .failed, code: (item.error as NSError?)?.code)
+                    if self.state != .failed { self.fail(.unsupported) }
+                default: break
+                }
+            }
         }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let ok = await self.engine.seek(to: CMTime(seconds: offset, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
-            guard self.openGeneration == generation else { return }
-            self.seeking = false
-            if ok && self.wantsPlayback { self.play() }
-            await self.readChapters(asset, bookID: book.id, track: index, generation: generation)
+        diagnostics.record(.readiness, .waiting)
+        preparationTimeout = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 40_000_000_000) } catch { return }
+            guard let self, self.openGeneration == generation, self.seeking else { return }
+            self.diagnostics.record(self.preparation.ready ? .seek : .readiness, .timeout)
+            self.fail(.preparation)
         }
+    }
+    private func restore(_ offset: Double, generation: UUID) {
+        // Avoid the unnecessary seek-to-zero altogether. A resume seek is issued
+        // only after readyToPlay, and its failure cannot silently disable autoplay.
+        if offset == 0 { finishRestore(generation: generation); return }
+        diagnostics.record(.seek, .started)
+        seekToken = UUID(); let token = seekToken
+        engine.seek(to: CMTime(seconds: offset, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor in
+                guard let self, self.openGeneration == generation, self.seekToken == token else { return }
+                guard finished else { self.diagnostics.record(.seek, .interrupted); self.fail(.seekFailed); return }
+                self.diagnostics.record(.seek, .complete)
+                self.finishRestore(generation: generation)
+            }
+        }
+    }
+    private func finishRestore(generation: UUID) {
+        guard openGeneration == generation, state != .failed else { return }
+        preparationTimeout?.cancel(); seeking = false
+        if wantsPlayback { play() } else { state = .paused }
+    }
+    private func updatePlaybackState() {
+        guard book != nil, state != .failed, !seeking else { return }
+        switch engine.timeControlStatus {
+        case .playing:
+            if state != .playing { diagnostics.record(.playing, .started) }
+            state = .playing; playing = true
+        case .waitingToPlayAtSpecifiedRate:
+            if state != .buffering { diagnostics.record(.buffering, .waiting) }
+            state = wantsPlayback ? .buffering : .paused; playing = false
+        default:
+            state = wantsPlayback ? .buffering : .paused; playing = false
+        }
+    }
+    private func fail(_ error: PlexError) {
+        preparationTimeout?.cancel(); wantsPlayback = false
+        engine.pause(); playing = false; state = .failed
+        diagnostics.record(.failure, .failed)
+        message = error.errorDescription ?? "Playback failed."
+        // Do not sample an unready item's zero time over the stored checkpoint.
     }
     func play() {
         guard book != nil else { return }
         wantsPlayback = true
+        guard preparation.ready, !seeking, state != .failed else { return }
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
             try AVAudioSession.sharedInstance().setActive(true)
+            diagnostics.record(.audioSession, .ready)
             engine.playImmediately(atRate: speed)
-            playing = true
-            nowPlaying()
-        } catch { message = "Could not start audio playback." }
+            updatePlaybackState(); nowPlaying()
+        } catch {
+            diagnostics.record(.audioSession, .failed, code: (error as NSError).code)
+            fail(.unavailable)
+        }
     }
     func pause() {
         wantsPlayback = false
         engine.pause(); playing = false; save(); nowPlaying()
+        if state != .failed {
+            if state != .paused { diagnostics.record(.paused, .complete) }
+            state = .paused
+        }
     }
     func skip(_ seconds: Double) {
         let target = max(0, min(elapsed + seconds, duration > 0 ? duration : .greatestFiniteMagnitude))
@@ -183,14 +282,9 @@ import Combine
             save()
         } else {
             seeking = true; elapsed = target; trackOffset = location.1; save()
-            openGeneration = UUID()
-            let generation = openGeneration
-            engine.seek(to: CMTime(seconds: location.1, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-                Task { @MainActor in
-                    guard let self, self.openGeneration == generation else { return }
-                    self.seeking = false
-                    if wasPlaying && self.wantsPlayback { self.play() }
-                }
+            if let offset = preparation.requestSeek(location.1) {
+                state = .loading
+                restore(offset, generation: openGeneration)
             }
         }
         nowPlaying()
@@ -206,6 +300,11 @@ import Combine
             pause(); openGeneration = UUID(); resource?.cancel(); resource = nil
             engine.replaceCurrentItem(with: nil); book = nil
         }
+    }
+    func close() {
+        pause(); openGeneration = UUID(); preparationTimeout?.cancel()
+        resource?.cancel(); resource = nil; engine.replaceCurrentItem(with: nil)
+        book = nil; state = .idle; MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
     private func readChapters(_ asset: AVURLAsset, bookID: UUID, track: Int, generation: UUID) async {
         do {

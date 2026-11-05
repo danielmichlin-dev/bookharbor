@@ -1,22 +1,11 @@
 import SwiftUI
 
-struct BookArtwork: View {
-    let book: Book
-    let root: URL
-    var body: some View {
-        Group {
-            if let file = book.artworkFile, let image = UIImage(contentsOfFile: root.appendingPathComponent(file).path) {
-                Image(uiImage: image).resizable().scaledToFill()
-            } else { Image(systemName: "book.closed.fill").font(.title).foregroundStyle(.teal) }
-        }.frame(width: 44, height: 52).clipped().accessibilityHidden(true)
-    }
-}
-
 struct PlexView: View {
     @ObservedObject var plex: PlexClient
     @ObservedObject var library: Library
     @ObservedObject var player: Player
     @ObservedObject var downloads: Downloads
+    @ObservedObject var shelf: ShelfController
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @State private var loadingBook = false
@@ -30,6 +19,7 @@ struct PlexView: View {
                         Button("Sign out on this iPhone", role: .destructive) {
                             signingOut = true
                             Task {
+                                shelf.cancelSelection()
                                 player.stopStreaming()
                                 await downloads.signOut()
                                 do { try plex.signOut() } catch { plex.status = "Could not remove all credentials. Please retry sign-out." }
@@ -44,81 +34,42 @@ struct PlexView: View {
                         }
                     }
                     Text(plex.status).font(.caption)
-                    Text("Sign in only on Plex’s website. Credentials stay in this iPhone’s Keychain. HTTP-only servers are unsupported; TLS verification stays enabled.").font(.caption)
+                    Text("Sign in only on Plexâ€™s website. Credentials stay in this iPhoneâ€™s Keychain. HTTP-only servers are unsupported; TLS verification stays enabled.").font(.caption)
                 }
                 if !plex.servers.isEmpty {
                     Section("Authorized servers") {
                         ForEach(plex.servers) { server in
                             Button { Task { await plex.select(server) } } label: {
                                 Label(server.name, systemImage: plex.selectedServer == server.id ? "checkmark.circle.fill" : "server.rack")
-                            }.disabled(plex.busy || loadingBook)
+                            }.disabled(plex.busy)
                         }
                     }
                 }
                 if !plex.libraries.isEmpty {
-                    Section("Audiobook library • music albums") {
+                    Section("Audiobook library â€¢ music albums") {
                         ForEach(plex.libraries) { section in
                             Button { Task { await plex.selectLibrary(section) } } label: {
                                 Label(section.title, systemImage: plex.selectedLibrary == section.id ? "checkmark.circle.fill" : "books.vertical")
-                            }.disabled(plex.busy || loadingBook)
+                            }.disabled(plex.busy)
                         }
-                    }
-                }
-                if plex.selectedLibrary != nil {
-                    Section("Books") {
-                        ForEach(plex.albums) { album in
-                            VStack(alignment: .leading) {
-                                Text(album.title).font(.headline)
-                                if let author = album.parentTitle { Text(author).font(.caption) }
-                                HStack {
-                                    Button("Stream") { load(album, download: false) }
-                                    Button("Download") { load(album, download: true) }
-                                }.buttonStyle(.bordered).disabled(loadingBook || signingOut)
-                            }
-                        }
-                        if plex.hasMore { Button("Load more books") { Task { await plex.loadMore() } }.disabled(plex.busy) }
                     }
                 }
                 Section("Storage") {
-                    Text("Keep BookHarbor open while downloading. Transfers pause when the app enters the background. iOS background downloads cannot enforce this app’s redirect policy; unattended background transfers are deferred.").font(.caption)
+                    Text("Keep BookHarbor open while downloading. Transfers pause when the app enters the background. iOS background downloads cannot enforce this appâ€™s redirect policy; unattended background transfers are deferred.").font(.caption)
                     Text("Local audio: \(ByteCountFormatter.string(fromByteCount: library.storageBytes, countStyle: .file))")
                     Text("Long-press a shelf book to download, restart, mark finished, or delete local audio. Plex deletions retain local progress. Partial tracks also count toward storage.").font(.caption)
                     if !downloads.message.isEmpty { Text(downloads.message).font(.caption) }
                 }
                 Section("About") {
-                    Text("BookHarbor 0.2 • Plex preview")
+                    Text("BookHarbor 0.3 â€¢ Plex preview")
                     Text("No analytics. Local books and progress are excluded from backup. Refresh signing with the same Apple Account and app identifier without uninstalling. Plex progress synchronization and external metadata lookup are not enabled.").font(.caption)
                 }
             }
             .navigationTitle("Plex & Settings")
             .toolbar { Button("Done") { dismiss() } }
-            .overlay { if loadingBook { ProgressView("Loading book…").padding().background(.regularMaterial).clipShape(RoundedRectangle(cornerRadius: 12)) } }
+            .overlay { if loadingBook { ProgressView("Loading bookâ€¦").padding().background(.regularMaterial).clipShape(RoundedRectangle(cornerRadius: 12)) } }
+            .onChange(of: library.selection) { _, _ in dismiss() }
             .onChange(of: plex.browserURL) { _, url in if let url { openURL(url) } }
-        }
-    }
-    private func load(_ album: PlexMetadata, download: Bool) {
-        loadingBook = true
-        Task {
-            defer { loadingBook = false }
-            do {
-                let book = try await plex.book(album, library: library)
-                // Artwork is optional; audio remains usable when it is absent or fails.
-                if let source = book.plex, let key = source.artwork,
-                   book.artworkFile == nil, let request = try? plex.request(key, server: source.serverID) {
-                    Task { @MainActor in
-                        if let (data, _) = try? await PlexTransport.shared.data(request),
-                           data.count <= 10 * 1024 * 1024, let image = UIImage(data: data),
-                           let jpeg = image.jpegData(compressionQuality: 0.8) {
-                            let filename = UUID().uuidString + ".jpg"
-                            do {
-                                try jpeg.write(to: library.root.appendingPathComponent(filename), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-                                library.update(book.id) { $0.artworkFile = filename }
-                            } catch { /* Optional artwork. */ }
-                        }
-                    }
-                }
-                if download { downloads.start(book) } else { player.open(book); dismiss() }
-            } catch { plex.report(error) }
         }
     }
 }
@@ -136,7 +87,7 @@ struct ChaptersView: View {
                             HStack {
                                 VStack(alignment: .leading) {
                                     Text(chapter.title)
-                                    Text("Track \(chapter.trackIndex + 1) • \(duration(chapter.duration))").font(.caption)
+                                    Text("Track \(chapter.trackIndex + 1) â€¢ \(duration(chapter.duration))").font(.caption)
                                 }
                                 Spacer()
                                 if player.currentChapterID == chapter.id { Image(systemName: "speaker.wave.2.fill") }
@@ -145,7 +96,7 @@ struct ChaptersView: View {
                     }
                 }
                 if let book = player.book, !book.tracks.isEmpty {
-                    Section("Files / tracks • not chapter boundaries") {
+                    Section("Files / tracks â€¢ not chapter boundaries") {
                         ForEach(Array(book.tracks.enumerated()), id: \.element.id) { index, track in
                             Button {
                                 player.seek(BookTimeline.absolute(track: index, offset: 0, tracks: book.tracks))

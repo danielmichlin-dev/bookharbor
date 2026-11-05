@@ -6,6 +6,20 @@ Native iPhone audiobook player for Plex, iOS 17+. Public source; private connect
 
 The previous version built an unsigned IPA and installed with Sideloadly. MP3 import, playback, and locked-iPhone playback were verified on a real iPhone by the owner. Version 0.2 adds a Plex preview; its compile/test status is tracked below. New Plex, download, chapter, Bluetooth, renewal, and migration behavior needs real-iPhone acceptance testing. Compilation is not device validation.
 
+## Version 0.3 bookshelf and streaming work
+
+Device observations from the owner: installing/updating, preservation of imported files, imported MP3 playback with the phone locked, Plex linking and library browsing work. Version 0.2 Plex streaming did not start. Version 0.3 is under automated validation; successful real-device streaming is NOT yet verified.
+
+Home now automatically caches every album page from the selected Plex music library, without fetching audio. It shows a searchable cover grid, multiple Continue Listening books, progress and complete/partial/offline status. Imports remain in Library and Imports; completed Plex copies are also accessible under Downloads across library selections. The selection persists locally. Refresh merges metadata using existing server/album identity and records library identity without replacing UUIDs, track files, chapters, completion state or listening positions. Missing/removed server entries are retained in the cache rather than deleting user data. Search covers cached titles/authors and broadens as automatic pagination completes.
+
+A cover tap resolves tracks lazily and immediately opens/resumes the book, preferring complete local copies. Partial downloads are clearly distinguished and playback still uses streaming until all files complete. Context menus, details and the player provide download actions; removal leaves Plex entries and progress intact. Artwork is fetched only for visible cards, bounded to four concurrent requests, cached locally and downsampled away from the main thread. No audio is downloaded to populate Home.
+
+The streaming path now waits for item readiness before restoring a nonzero position, skips an unnecessary seek to zero, handles failed/interrupted seeks explicitly, and shows Loading, Buffering, Playing, Paused and Failed states. Content-information probes are separate from media-data loading; consistent short byte ranges are accepted and continued, and MPEG-4 audiobook content uses an audio content type. Original-media requests use an audio-appropriate Accept header. Certificate validation, same-origin key validation and redirect refusal remain enabled. There is still no transcoding or automatic connection failover.
+
+The exact cause on the owner's Plex/iPhone remains unconfirmed without device diagnostics. Code inspection established the previous unready-seek/silent-failure path, loss of HTTP error detail and rejection of consistent short ranges. Synthetic AVPlayer integration tests now exercise delayed remote readiness, range loading, resume/chapter seeking and generated WAV/AAC media. See STREAMING_DIAGNOSTICS.md for evidence and the exact safe report to collect if playback still fails.
+
+Current version 0.3 automated build status: pending. Previous successful version 0.2 checks are retained below as historical evidence, not validation of this revision.
+
 ## Implemented in the Plex preview
 
 - Browser-based Plex PIN account linking; no manually copied token or password field. Tokens and validated server connections use device-only Keychain storage. Sign-out cancels transfers, clears saved Plex credentials, and retains completed audio and progress. Revoke the authorized device in Plex to revoke server-side access.

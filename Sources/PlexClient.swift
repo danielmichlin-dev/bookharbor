@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 // All network sessions fail closed on redirects, including same-host redirects.
 // No authentication challenge handler: system TLS validation remains in force.
@@ -12,8 +13,10 @@ final class NoRedirect: NSObject, URLSessionTaskDelegate {
 final class PlexTransport {
     static let shared = PlexTransport()
     private let delegate = NoRedirect()
+    private let configuration: URLSessionConfiguration
+    init(configuration: URLSessionConfiguration = .ephemeral) { self.configuration = configuration }
     private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
+        let config = configuration
         config.urlCache = nil
         config.httpCookieStorage = nil
         config.timeoutIntervalForRequest = 30
@@ -37,8 +40,7 @@ final class PlexTransport {
             let (bytes, response) = try await session.bytes(for: request)
             defer { bytes.task.cancel() }
             guard let http = response as? HTTPURLResponse else { throw PlexError.unavailable }
-            if [401, 403, 498].contains(http.statusCode) { throw PlexError.authentication }
-            guard (200...299).contains(http.statusCode) else { throw PlexError.unavailable }
+            guard (200...299).contains(http.statusCode) else { throw PlexError.http(http.statusCode) }
             // Reject ignored Range requests/oversized responses before buffering them.
             guard response.expectedContentLength <= Int64(limit) else { throw PlexError.incomplete }
             var data = Data()
@@ -49,11 +51,23 @@ final class PlexTransport {
             return (data, http)
         } catch is CancellationError { throw CancellationError() }
         catch let error as PlexError { throw error }
+        catch let error as URLError { throw PlexError.network(error.code.rawValue) }
         catch { throw PlexError.unavailable } // Never expose underlying URL/userInfo.
     }
 }
 
 @MainActor final class PlexClient: ObservableObject {
+    weak var library: Library?
+    typealias ContainerFetch = (String, String, [URLQueryItem], Int) async throws -> PlexContainer
+    private let containerFetch: ContainerFetch?
+    private let requestFactory: ((String, String) throws -> URLRequest)?
+    init(library: Library? = nil, containerFetch: ContainerFetch? = nil,
+         requestFactory: ((String, String) throws -> URLRequest)? = nil) {
+        self.library = library
+        self.containerFetch = containerFetch; self.requestFactory = requestFactory
+        selectedServer = library?.selection?.serverID
+        selectedLibrary = library?.selection?.libraryID
+    }
     @Published var status = ""
     @Published var busy = false
     @Published var linked = !SecureSettings.read("plex-account").isEmpty
@@ -68,6 +82,7 @@ final class PlexTransport {
     private var offset = 0
     private var generation = UUID()
     private var pin: Pin?
+    private var artworkTasks = Set<UUID>()
     struct Pin: Decodable { let id: Int; let code: String; let authToken: String?; let expiresIn: Int? }
     var clientID: String {
         get throws {
@@ -158,8 +173,25 @@ final class PlexTransport {
     }
     func selectLibrary(_ library: PlexDirectory) async {
         guard !busy else { return }
+        guard let server = selectedServer else { return }
+        do { try self.library?.selectShelf(ShelfSelection(serverID: server, libraryID: library.key)) }
+        catch { report(error); return }
         generation = UUID(); selectedLibrary = library.key; offset = 0; albums = []; hasMore = true
-        await loadMore()
+        await loadAllPages()
+    }
+    func refreshShelf() async {
+        guard !busy, let selection = library?.selection, linked else { return }
+        selectedServer = selection.serverID; selectedLibrary = selection.libraryID
+        generation = UUID(); offset = 0; albums = []; hasMore = true
+        await loadAllPages()
+    }
+    private func loadAllPages() async {
+        let current = generation
+        repeat {
+            await loadMore()
+            if current != generation || Task.isCancelled { return }
+            await Task.yield()
+        } while hasMore
     }
     func loadMore() async {
         guard !busy, hasMore, let server = selectedServer, let library = selectedLibrary else { return }
@@ -172,14 +204,23 @@ final class PlexTransport {
             let entries = page.Metadata ?? []
             guard page.offset == nil || page.offset == offset else { throw PlexError.malformed }
             let fresh = entries.filter { item in !albums.contains(where: { $0.id == item.id }) }
+            try self.library?.mergeAlbums(entries, server: server, library: library)
             albums += fresh; offset += entries.count
             hasMore = !fresh.isEmpty && page.hasMore(after: offset, returnedCount: entries.count)
             status = "\(albums.count) books loaded. Books are Plex albums; disc and track numbers determine playback order."
-        } catch { report(error) }
+        } catch { hasMore = false; report(error) }
     }
     func book(_ album: PlexMetadata, library: Library) async throws -> Book {
         guard let server = selectedServer else { throw PlexError.unavailable }
-        let key = try PlexURL.component(album.ratingKey)
+        let placeholder = try library.upsert(title: album.title, source: PlexBookSource(serverID: server, ratingKey: album.ratingKey,
+            author: album.parentTitle, artwork: album.thumb, tracks: [], libraryID: selectedLibrary))
+        return try await resolve(placeholder, library: library)
+    }
+    func resolve(_ book: Book, library: Library) async throws -> Book {
+        guard let original = book.plex else { return book }
+        if !original.tracks.isEmpty { return library.books.first { $0.id == book.id } ?? book }
+        let server = original.serverID
+        let key = try PlexURL.component(original.ratingKey)
         var all: [PlexMetadata] = []
         var start = 0
         while true {
@@ -192,22 +233,47 @@ final class PlexTransport {
             guard start < 100_000 else { throw PlexError.malformed }
         }
         let tracks = try PlexBooks.tracks(all)
-        let source = PlexBookSource(serverID: server, ratingKey: album.ratingKey, author: album.parentTitle,
-                                   artwork: album.thumb, tracks: tracks)
+        let source = PlexBookSource(serverID: server, ratingKey: original.ratingKey, author: original.author,
+                                   artwork: original.artwork, tracks: tracks, libraryID: original.libraryID)
         // Validate every media path before storing metadata or scheduling work.
         for track in tracks { _ = try mediaRequest(source: source, track: track) }
-        return try library.upsert(title: album.title, source: source)
+        return try library.upsert(title: book.title, source: source)
     }
     func mediaRequest(source: PlexBookSource, track: BookTrack) throws -> URLRequest {
-        try request(track.key, server: source.serverID)
+        var request = try request(track.key, server: source.serverID)
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        return request
+    }
+    func cacheArtwork(_ book: Book) async {
+        guard book.artworkFile == nil, let source = book.plex, let key = source.artwork,
+              let library, linked, !artworkTasks.contains(book.id) else { return }
+        while artworkTasks.count >= 4 {
+            do { try await Task.sleep(nanoseconds: 100_000_000); try Task.checkCancellation() } catch { return }
+        }
+        guard linked, !artworkTasks.contains(book.id), !Task.isCancelled else { return }
+        artworkTasks.insert(book.id)
+        defer { artworkTasks.remove(book.id) }
+        do {
+            var request = try request(key, server: source.serverID)
+            request.setValue("image/*", forHTTPHeaderField: "Accept")
+            let (data, _) = try await PlexTransport.shared.data(request, limit: 10 * 1024 * 1024)
+            // Keep the original validated image; cells downsample off the main thread.
+            guard UIImage(data: data) != nil else { return }
+            let file = UUID().uuidString + ".image"
+            try data.write(to: library.root.appendingPathComponent(file), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            if !library.update(book.id, { $0.artworkFile = file }) { try? FileManager.default.removeItem(at: library.root.appendingPathComponent(file)) }
+        } catch { /* Missing artwork and an offline network never block the shelf. */ }
     }
     func request(_ key: String, server: String) throws -> URLRequest {
+        if let requestFactory { return try requestFactory(key, server) }
         let base = try PlexURL.base(SecureSettings.read("plex-base-" + server))
         let token = SecureSettings.read("plex-token-" + server)
         guard !token.isEmpty, linked else { throw PlexError.authentication }
         return try PlexTransport.request(url: PlexURL.resolve(key, base: base), token: token, client: clientID)
     }
     func container(_ key: String, server: String, query: [URLQueryItem] = [], start: Int = 0) async throws -> PlexContainer {
+        if let containerFetch { return try await containerFetch(key, server, query, start) }
         var request = try request(key, server: server)
         var url = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
         url.queryItems = query.isEmpty ? nil : query
