@@ -18,12 +18,15 @@ import UniformTypeIdentifiers
         _plex = StateObject(wrappedValue: connection)
         _downloads = StateObject(wrappedValue: transfers)
         _player = StateObject(wrappedValue: audio)
-        AppDelegate.reconnect = { _ = transfers }
+        AppDelegate.reconnect = { transfers.reconnect() }
     }
     var body: some Scene {
         WindowGroup {
             ContentView(library: library, player: player, plex: plex, downloads: downloads)
-                .onChange(of: phase) { _, _ in player.save() }
+                .onChange(of: phase) { _, phase in
+                    player.save()
+                    if phase == .background { downloads.pauseForBackground() }
+                }
         }
     }
 }

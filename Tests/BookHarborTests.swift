@@ -5,7 +5,7 @@ import AVFoundation
 final class BookHarborTests: XCTestCase {
     func testEmbeddedChapterGroupsPreserveTitleAndExactTimes() async {
         let title = AVMutableMetadataItem()
-        title.keySpace = .common; title.key = AVMetadataKey.commonKeyTitle as NSString
+        title.identifier = .commonIdentifierTitle
         title.value = "Synthetic embedded chapter" as NSString
         let group = AVTimedMetadataGroup(items: [title], timeRange: CMTimeRange(start: CMTime(seconds: 2.125, preferredTimescale: 600), duration: CMTime(seconds: 4.5, preferredTimescale: 600)))
         let chapters = await ChapterReader.parse([group], track: 1)
@@ -83,6 +83,8 @@ final class BookHarborTests: XCTestCase {
         XCTAssertEqual(location.0, 1); XCTAssertEqual(location.1, 4)
     }
     func testDownloadCompletionAndFailures() throws {
+        try DownloadValidation.requireRedirectControl(.ephemeral)
+        XCTAssertThrowsError(try DownloadValidation.requireRedirectControl(.background(withIdentifier: "synthetic-test-background")))
         try DownloadValidation.check(status: 200, mime: "audio/mp4", actual: 100, expected: 100)
         try DownloadValidation.check(status: 206, mime: "application/octet-stream", actual: 100, expected: 100)
         for status in [302, 401, 403, 404, 500] {
@@ -119,6 +121,9 @@ final class BookHarborTests: XCTestCase {
         library.update(a.id) { book in
             book.title = "Corrected synthetic title"
             book.plex?.tracks[0].filename = "synthetic-one.mp3"
+        }
+        XCTAssertFalse(library.books.first(where: { $0.id == a.id })!.offline)
+        library.update(a.id) { book in
             book.plex?.tracks[1].filename = "synthetic-two.mp3"
             book.finished = true
         }

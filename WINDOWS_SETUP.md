@@ -1,5 +1,11 @@
 # Windows and PowerShell setup
 
+The repository is already published and the initial installation is verified. For
+an existing installation, follow README.md's update/download commands and preserve
+the same signing account and app identifier without uninstalling. The initial
+repository-creation steps below are historical setup instructions; do not recreate
+the existing repository or reinitialize Git for an update.
+
 ## 1. Extract the project
 
 Download BookHarbor-Starter.zip and extract it. Open PowerShell in the resulting

@@ -32,12 +32,20 @@ final class PlexTransport {
         if !token.isEmpty { request.setValue(token, forHTTPHeaderField: "X-Plex-Token") }
         return request
     }
-    func data(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    func data(_ request: URLRequest, limit: Int = 16 * 1024 * 1024) async throws -> (Data, HTTPURLResponse) {
         do {
-            let (data, response) = try await session.data(for: request)
+            let (bytes, response) = try await session.bytes(for: request)
+            defer { bytes.task.cancel() }
             guard let http = response as? HTTPURLResponse else { throw PlexError.unavailable }
             if [401, 403, 498].contains(http.statusCode) { throw PlexError.authentication }
             guard (200...299).contains(http.statusCode) else { throw PlexError.unavailable }
+            // Reject ignored Range requests/oversized responses before buffering them.
+            guard response.expectedContentLength <= Int64(limit) else { throw PlexError.incomplete }
+            var data = Data()
+            for try await byte in bytes {
+                guard data.count < limit else { throw PlexError.incomplete }
+                data.append(byte)
+            }
             return (data, http)
         } catch is CancellationError { throw CancellationError() }
         catch let error as PlexError { throw error }

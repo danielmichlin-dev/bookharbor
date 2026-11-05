@@ -152,6 +152,9 @@ enum PlexBooks {
 }
 
 enum DownloadValidation {
+    static func requireRedirectControl(_ configuration: URLSessionConfiguration) throws {
+        guard configuration.identifier == nil else { throw PlexError.unsafeURL }
+    }
     static func check(status: Int, mime: String?, actual: Int64, expected: Int64) throws {
         guard status == 200 || status == 206, expected > 0, actual == expected,
               let mime, mime.hasPrefix("audio/") || ["application/octet-stream", "video/mp4", "application/mp4"].contains(mime) else { throw PlexError.incomplete }

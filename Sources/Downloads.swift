@@ -23,7 +23,16 @@ struct DownloadJob: Codable, Identifiable {
     private var ready = false
     private var validating = 0
     private var eventsFinished = false
+    private var backgroundBudget: UIBackgroundTaskIdentifier = .invalid
+    // Authenticated jobs MUST use this in-process session: background URLSession
+    // follows redirects without consulting willPerformHTTPRedirection.
     private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil; config.httpCookieStorage = nil
+        return URLSession(configuration: config, delegate: self, delegateQueue: .main)
+    }()
+    // Lifecycle foundation only. No authenticated task is ever scheduled here.
+    private lazy var backgroundSession: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: Self.identifier)
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
@@ -40,12 +49,16 @@ struct DownloadJob: Codable, Identifiable {
         _ = session
         Task { await restore() }
     }
-    private func persist() {
+    @discardableResult private func persist() -> Bool {
         do {
             try JSONEncoder().encode(jobs).write(to: root.appendingPathComponent("downloads.json"), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-        } catch { message = "Could not save the download queue. Check free storage." }
+            return true
+        } catch { message = "Could not save the download queue. Check free storage."; return false }
     }
     private func restore() async {
+        // Cancel obsolete background work; credentials must never be resubmitted
+        // through a session which cannot veto redirects.
+        for task in await backgroundSession.allTasks { task.cancel() }
         let tasks = await session.allTasks
         for task in tasks {
             guard let job = jobs.first(where: { $0.tag == task.taskDescription }),
@@ -76,6 +89,7 @@ struct DownloadJob: Codable, Identifiable {
               let book = library.books.first(where: { $0.id == id }), let source = book.plex,
               source.tracks.indices.contains(jobs[index].track) else { return }
         do {
+            try DownloadValidation.requireRedirectControl(session.configuration)
             let remaining = source.tracks.filter { $0.filename == nil }.reduce(Int64(0)) { $0 + $1.bytes }
             let available = try root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage ?? 0
             // Account for temporary transfer storage and finalization headroom.
@@ -90,7 +104,8 @@ struct DownloadJob: Codable, Identifiable {
             jobs[index].resumeKey = nil
             jobs[index].state = "Downloading"
             task.taskDescription = jobs[index].tag
-            persist(); task.resume()
+            guard persist() else { task.cancel(); throw PlexError.storage }
+            task.resume()
         } catch {
             jobs[index].state = "Retry needed"
             message = (error as? PlexError)?.errorDescription ?? "Could not start this download."
@@ -130,6 +145,24 @@ struct DownloadJob: Codable, Identifiable {
     func signOut() async {
         for id in jobs.map(\.bookID) { await cancel(id, resumable: false) }
     }
+    func pauseForBackground() {
+        guard backgroundBudget == .invalid else { return }
+        backgroundBudget = UIApplication.shared.beginBackgroundTask(withName: "Save download checkpoint") { [weak self] in
+            Task { @MainActor in self?.endBackgroundBudget() }
+        }
+        Task { @MainActor in
+            for id in jobs.filter({ $0.state == "Downloading" }).map(\.bookID) {
+                await cancel(id)
+            }
+            endBackgroundBudget()
+        }
+    }
+    private func endBackgroundBudget() {
+        if backgroundBudget != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundBudget)
+            backgroundBudget = .invalid
+        }
+    }
     nonisolated func urlSession(_ session: URLSession, task: URLSessionTask,
         willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
@@ -145,10 +178,12 @@ struct DownloadJob: Codable, Identifiable {
         }
         let tag = downloadTask.taskDescription
         let response = downloadTask.response as? HTTPURLResponse
-        Task { @MainActor in await self.finish(tag: tag, response: response, staged: staged) }
+        MainActor.assumeIsolated {
+            self.validating += 1
+            Task { @MainActor in await self.finish(tag: tag, response: response, staged: staged) }
+        }
     }
     private func finish(tag: String?, response: HTTPURLResponse?, staged: URL) async {
-        validating += 1
         defer {
             try? FileManager.default.removeItem(at: staged)
             validating -= 1
@@ -223,10 +258,11 @@ struct DownloadJob: Codable, Identifiable {
         }
     }
     nonisolated func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        Task { @MainActor in self.eventsFinished = true; self.completeEventsIfReady() }
+        MainActor.assumeIsolated { self.eventsFinished = true; self.completeEventsIfReady() }
     }
+    func reconnect() { _ = backgroundSession; completeEventsIfReady() }
     private func completeEventsIfReady() {
-        if eventsFinished && validating == 0 {
+        if eventsFinished && validating == 0 && AppDelegate.backgroundCompletion != nil {
             eventsFinished = false
             AppDelegate.completeBackgroundEvents()
         }

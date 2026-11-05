@@ -36,7 +36,7 @@ final class MediaResource: NSObject, AVAssetResourceLoaderDelegate {
                         var request = self.request
                         request.setValue("bytes=\(offset)-\(last)", forHTTPHeaderField: "Range")
                         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-                        let (data, response) = try await PlexTransport.shared.data(request)
+                        let (data, response) = try await PlexTransport.shared.data(request, limit: 1024 * 1024)
                         // Refuse servers that ignore Range instead of buffering an entire book.
                         guard response.statusCode == 206,
                               response.value(forHTTPHeaderField: "Content-Range") == "bytes \(offset)-\(last)/\(self.bytes)",

@@ -80,6 +80,7 @@ struct PlexView: View {
                     }
                 }
                 Section("Storage") {
+                    Text("Keep BookHarbor open while downloading. Transfers pause when the app enters the background. iOS background downloads cannot enforce this app’s redirect policy; unattended background transfers are deferred.").font(.caption)
                     Text("Local audio: \(ByteCountFormatter.string(fromByteCount: library.storageBytes, countStyle: .file))")
                     Text("Long-press a shelf book to download, restart, mark finished, or delete local audio. Plex deletions retain local progress. Partial tracks also count toward storage.").font(.caption)
                     if !downloads.message.isEmpty { Text(downloads.message).font(.caption) }
