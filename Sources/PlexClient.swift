@@ -41,8 +41,13 @@ final class PlexTransport {
             defer { bytes.task.cancel() }
             guard let http = response as? HTTPURLResponse else { throw PlexError.unavailable }
             guard (200...299).contains(http.statusCode) else { throw PlexError.http(http.statusCode) }
+            if request.value(forHTTPHeaderField: "Range") != nil && http.statusCode != 206 {
+                throw PlexError.http(http.statusCode)
+            }
             // Reject ignored Range requests/oversized responses before buffering them.
-            guard response.expectedContentLength <= Int64(limit) else { throw PlexError.incomplete }
+            guard response.expectedContentLength <= Int64(limit) else {
+                throw request.value(forHTTPHeaderField: "Range") == nil ? PlexError.incomplete : PlexError.range
+            }
             var data = Data()
             for try await byte in bytes {
                 guard data.count < limit else { throw PlexError.incomplete }

@@ -3,6 +3,65 @@ import AVFoundation
 @testable import BookHarbor
 
 final class BookshelfPlaybackTests: XCTestCase {
+    func testTransportRejectsIgnoredRangeBeforeBufferingFullBody() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SyntheticHTTPProtocol.self]
+        let transport = PlexTransport(configuration: configuration)
+        var request = try syntheticRequest()
+        request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        do { _ = try await transport.data(request, limit: 2); XCTFail("An ignored Range must fail") }
+        catch PlexError.http(let code) { XCTAssertEqual(code, 200) }
+        catch { XCTFail("Expected the sanitized HTTP status, not a byte-limit error") }
+    }
+    @MainActor func testCoverTapResolvesOnceThenResumesCompletedCopyWithoutNetwork() async throws {
+        let root = temporaryRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let library = Library(root: root)
+        let audio = try silentWAV(root: root)
+        let book = try library.upsert(title: "Synthetic cover", source: PlexBookSource(serverID: "s", ratingKey: "1", tracks: [], libraryID: "7"))
+        var metadataCalls = 0
+        let plex = PlexClient(library: library, containerFetch: { key, _, _, _ in
+            XCTAssertEqual(key, "/library/metadata/1/children"); metadataCalls += 1
+            let part = PlexPart(key: "/library/parts/1/audio.wav", size: Int64(audio.count), duration: 12000, container: "wav")
+            let media = PlexMedia(container: "wav", Part: [part])
+            let track = PlexMetadata(ratingKey: "10", title: "Synthetic track", index: 1, duration: 12000, Media: [media])
+            return PlexContainer(offset: 0, size: 1, totalSize: 1, Metadata: [track])
+        }, requestFactory: { _, _ in try self.syntheticRequest() })
+        var networkCalls = 0
+        let player = Player(library: library, remoteRequest: { source, track in try plex.mediaRequest(source: source, track: track) }, fetch: { request, _ in
+            networkCalls += 1; return try self.rangeReply(request, audio: audio)
+        })
+        defer { player.close() }
+        let downloads = Downloads(library: library, plex: plex)
+        let shelf = ShelfController(library: library, plex: plex, player: player, downloads: downloads)
+        shelf.play(book)
+        await waitUntil { player.state == .playing || player.state == .failed }
+        XCTAssertEqual(player.state, .playing, player.diagnostics.text)
+        XCTAssertEqual(metadataCalls, 1); XCTAssertGreaterThan(networkCalls, 0)
+        shelf.cancelSelection(); player.seek(2.125)
+        await waitUntil { player.state == .paused || player.state == .failed }
+        library.update(book.id) { $0.plex?.tracks[0].filename = "synthetic.wav" }
+        plex.linked = false
+        let previousNetworkCalls = networkCalls
+        shelf.play(library.books[0])
+        await waitUntil { player.state == .playing || player.state == .failed }
+        XCTAssertEqual(player.state, .playing, player.diagnostics.text)
+        XCTAssertEqual(metadataCalls, 1); XCTAssertEqual(networkCalls, previousNetworkCalls)
+        XCTAssertTrue(player.diagnostics.events.contains { $0.stage == .source && $0.fact == .local })
+        player.pause(); let checkpoint = library.books[0].position
+        await shelf.removeDownload(library.books[0])
+        XCTAssertEqual(library.books.count, 1)
+        XCTAssertEqual(library.books[0].position, checkpoint)
+        XCTAssertFalse(library.books[0].offline)
+        XCTAssertEqual(Library(root: root).books[0].position, checkpoint)
+    }
+    @MainActor func testNestedErrorDiagnosticsOnlyCopyNumericCodes() {
+        let diagnostics = PlaybackDiagnostics()
+        let underlying = NSError(domain: "SyntheticDomain", code: -1009, userInfo: [NSLocalizedDescriptionKey: "Synthetic private title", NSURLErrorFailingURLErrorKey: URL(string: "https://media.example.invalid")!])
+        diagnostics.recordErrorCodes(NSError(domain: "SyntheticOuter", code: -11800, userInfo: [NSUnderlyingErrorKey: underlying]), stage: .item)
+        XCTAssertEqual(diagnostics.events.map(\.code), [-11800, -1009])
+        XCTAssertFalse(diagnostics.text.contains("Synthetic"))
+        XCTAssertFalse(diagnostics.text.contains("https"))
+    }
     func testInitialRestoreWaitsForReadinessAndRunsOnce() {
         var preparation = PlaybackPreparation(offset: 42.125)
         XCTAssertFalse(preparation.ready)
@@ -209,4 +268,17 @@ final class BookshelfPlaybackTests: XCTestCase {
             headerFields: ["Content-Range": "bytes \(start)-\(end)/\(audio.count)", "Content-Type": mime, "Content-Length": String(data.count)])!
         return (data, response)
     }
+}
+
+private final class SyntheticHTTPProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "media.example.invalid" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil,
+            headerFields: ["Content-Type": "audio/wav", "Content-Length": "1000000"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(repeating: 0, count: 64))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() { }
 }

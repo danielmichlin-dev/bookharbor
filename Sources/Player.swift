@@ -178,7 +178,7 @@ import Combine
                     self.restore(offset, generation: generation)
                     Task { await self.readChapters(asset, bookID: book.id, track: index, generation: generation) }
                 case .failed:
-                    self.diagnostics.record(.item, .failed, code: (item.error as NSError?)?.code)
+                    self.diagnostics.recordErrorCodes(item.error, stage: .item)
                     if self.state != .failed { self.fail(.unsupported) }
                 default: break
                 }
@@ -228,6 +228,13 @@ import Combine
     private func fail(_ error: PlexError) {
         preparationTimeout?.cancel(); wantsPlayback = false
         engine.pause(); playing = false; state = .failed
+        switch error {
+        case .http(let code): diagnostics.record(.http, .rejected, code: code)
+        case .network(let code): diagnostics.record(.connection, .failed, code: code)
+        case .authentication: diagnostics.record(.authentication, .rejected)
+        case .unsafeURL: diagnostics.record(.connection, .rejected)
+        default: break
+        }
         diagnostics.record(.failure, .failed)
         message = error.errorDescription ?? "Playback failed."
         // Do not sample an unready item's zero time over the stored checkpoint.

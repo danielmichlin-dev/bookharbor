@@ -22,6 +22,14 @@ struct PlaybackDiagnostic: Identifiable {
         if events.count > 32 { events.removeFirst(events.count - 32) }
     }
     var text: String { events.map(\.line).joined(separator: "\n") }
+    func recordErrorCodes(_ error: Error?, stage: PlaybackStage) {
+        var current = error as NSError?
+        for _ in 0..<3 {
+            guard let value = current else { break }
+            record(stage, .failed, code: value.code)
+            current = value.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+    }
 }
 
 // Initial restore is a one-shot action gated on readiness, never on a speculative

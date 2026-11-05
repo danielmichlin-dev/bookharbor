@@ -13,6 +13,7 @@ enum PlexError: Error, LocalizedError {
         case .storage: return "Not enough available storage for this book. Delete a local download and retry."
         case .unsupported: return "This book has no compatible original audio. Transcoding is not enabled."
         case .http(let code):
+            if code == 200 { return "Plex ignored the byte-range request (HTTP 200). Streaming requires byte-range support. The full file was not buffered." }
             if [401, 403, 498].contains(code) { return "Plex rejected authorization or access (HTTP \(code)). Link again or check server permissions. Downloaded books remain available." }
             if (300...399).contains(code) { return "The media request was redirected (HTTP \(code)). The redirect was blocked to protect your credentials." }
             return "Plex media request failed (HTTP \(code)). Check server availability and original-media access."
