@@ -41,3 +41,9 @@ Before publication, inspect all intended files, staged diffs, every existing com
 and Git author metadata. The included pattern scanner is a limited guardrail, not a
 guarantee. If a real secret is committed, rotate it and clean history before pushing.
 Runtime data, screenshots and audio files must not be copied into this repository.
+
+## Bookshelf and diagnostics
+
+The selected server/library identity and cached albums, covers, chapters and progress stay in the excluded Application Support folder. Cached metadata does not trigger audio downloads. Visible cover cards request artwork only from the selected validated Plex origin. No external enrichment provider is contacted.
+
+Playback diagnostics stay in RAM and contain only predefined stage/fact names and numeric HTTP/network/AVPlayer codes. Nested error descriptions, domains, URLs, userInfo, headers, titles, account identifiers and listening positions are not copied. The app does not automatically log, upload or persist the trace; copying it requires an explicit user button. Never publish shelf screenshots or raw iOS console output containing private data.
