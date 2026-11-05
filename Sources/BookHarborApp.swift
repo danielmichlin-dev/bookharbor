@@ -2,17 +2,27 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 @main struct BookHarborApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var plex: PlexClient
+    @StateObject private var downloads: Downloads
     @StateObject private var library: Library
     @StateObject private var player: Player
     @Environment(\.scenePhase) private var phase
     init() {
         let model = Library()
         _library = StateObject(wrappedValue: model)
-        _player = StateObject(wrappedValue: Player(library: model))
+        let connection = PlexClient()
+        let audio = Player(library: model)
+        audio.plex = connection
+        let transfers = Downloads(library: model, plex: connection)
+        _plex = StateObject(wrappedValue: connection)
+        _downloads = StateObject(wrappedValue: transfers)
+        _player = StateObject(wrappedValue: audio)
+        AppDelegate.reconnect = { _ = transfers }
     }
     var body: some Scene {
         WindowGroup {
-            ContentView(library: library, player: player)
+            ContentView(library: library, player: player, plex: plex, downloads: downloads)
                 .onChange(of: phase) { _, _ in player.save() }
         }
     }
@@ -21,6 +31,9 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @ObservedObject var library: Library
     @ObservedObject var player: Player
+    @ObservedObject var plex: PlexClient
+    @ObservedObject var downloads: Downloads
+    @State private var chapterList = false
     @State private var importing = false
     @State private var settings = false
     @State private var pendingDelete: Book?
@@ -28,26 +41,21 @@ struct ContentView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 if library.books.isEmpty {
-                    ContentUnavailableView("Your listening shelf", systemImage: "books.vertical", description: Text("Import an audiobook from Files to listen offline. Plex connection is coming in the next milestone."))
+                    ContentUnavailableView("Your listening shelf", systemImage: "books.vertical", description: Text("Import an audiobook from Files to listen offline. Connect to Plex in Settings to browse your audiobook library."))
                 } else {
-                    List(library.books) { book in
-                        Button { player.open(book) } label: {
-                            HStack {
-                                Image(systemName: "book.closed.fill").font(.title).foregroundStyle(.teal)
-                                VStack(alignment: .leading) {
-                                    Text(book.title).foregroundStyle(.primary)
-                                    Text("Offline • Resume at \(clock(book.position))").font(.caption).foregroundStyle(.secondary)
-                                }
-                            }.padding(.vertical, 6)
-                        }.swipeActions {
-                            Button("Delete", role: .destructive) { pendingDelete = book }
-                                .disabled(player.book?.id == book.id)
+                    List {
+                        let continuing = library.books.filter { $0.position > 0 && $0.finished != true }
+                            .sorted { ($0.progress?.updatedAt ?? .distantPast) > ($1.progress?.updatedAt ?? .distantPast) }
+                        if !continuing.isEmpty {
+                            Section("Continue Listening") { ForEach(continuing) { book in shelfRow(book) } }
                         }
+                        Section("All books") { ForEach(library.books) { book in shelfRow(book) } }
                     }
                 }
                 if let book = player.book {
                     VStack(spacing: 14) {
                         Text(book.title).font(.headline).lineLimit(2)
+                        Button("Chapters & tracks") { chapterList = true }
                         Text("\(clock(player.elapsed)) / \(clock(player.duration))")
                             .monospacedDigit().foregroundStyle(.secondary)
                         HStack(spacing: 36) {
@@ -60,9 +68,9 @@ struct ContentView: View {
                                 .accessibilityLabel("Forward 30 seconds")
                         }.font(.title)
                         HStack {
-                            Menu("\(player.speed, specifier: "%.2g")× speed") {
+                            Menu("\(player.speed, specifier: "%.2g")x speed") {
                                 ForEach([0.75, 1, 1.25, 1.5, 1.75, 2], id: \.self) { rate in
-                                    Button("\(rate, specifier: "%.2g")×") { player.changeSpeed(Float(rate)) }
+                                    Button("\(rate, specifier: "%.2g")x") { player.changeSpeed(Float(rate)) }
                                 }
                             }
                             Spacer()
@@ -86,7 +94,8 @@ struct ContentView: View {
                     Button { importing = true } label: { Label("Import", systemImage: "plus") }
                 }
             }
-            .sheet(isPresented: $settings) { SettingsView() }
+            .sheet(isPresented: $settings) { PlexView(plex: plex, library: library, player: player, downloads: downloads) }
+            .sheet(isPresented: $chapterList) { ChaptersView(player: player) }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.audio, UTType(filenameExtension: "m4b") ?? .audio]) { result in
                 switch result {
                 case .success(let url): library.importFile(url)
@@ -96,55 +105,47 @@ struct ContentView: View {
             .alert("Delete downloaded book?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })) {
                 Button("Delete", role: .destructive) { if let book = pendingDelete { library.remove(book) }; pendingDelete = nil }
                 Button("Cancel", role: .cancel) { pendingDelete = nil }
-            } message: { Text("This removes the local copy and its saved position.") }
+            } message: { Text("This removes local audio. Plex books retain metadata and progress; imported books and their progress are deleted.") }
         }.tint(.teal)
+    }
+    @ViewBuilder private func shelfRow(_ book: Book) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button { player.open(book) } label: {
+                HStack {
+                    BookArtwork(book: book, root: library.root)
+                    VStack(alignment: .leading) {
+                        Text(book.title).foregroundStyle(.primary)
+                        if let author = book.plex?.author { Text(author).font(.caption) }
+                        Text("\(book.offline ? "Offline" : "Plex") | \(book.finished == true ? "Finished" : "Resume at " + clock(book.position))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if let job = downloads.jobs.first(where: { $0.bookID == book.id }) {
+                Text(job.state).font(.caption)
+                ProgressView(value: downloads.fractions[book.id] ?? 0)
+                HStack {
+                    Button("Retry / resume") { downloads.start(book) }.disabled(job.state == "Downloading")
+                    Button("Pause download") { Task { await downloads.cancel(book.id) } }.disabled(job.state != "Downloading")
+                    Button("Cancel") { Task { await downloads.cancel(book.id, resumable: false) } }
+                }.font(.caption).buttonStyle(.borderless)
+            }
+        }
+        .contextMenu {
+            if book.plex != nil && !book.offline { Button("Download offline") { downloads.start(book) } }
+            Button(book.finished == true ? "Mark unfinished" : "Mark finished") {
+                library.update(book.id) { $0.finished = !(book.finished ?? false) }
+            }
+            Button("Restart from beginning") {
+                if player.book?.id == book.id { player.pause(); player.seek(0) }
+                library.update(book.id) { $0.position = 0; $0.progress = nil; $0.finished = false }
+            }
+            Button("Delete local audio", role: .destructive) { pendingDelete = book }
+                .disabled(player.book?.id == book.id || downloads.jobs.contains { $0.bookID == book.id && $0.state == "Downloading" })
+        }
     }
     private func clock(_ value: Double) -> String {
         let seconds = Int(value.isFinite ? max(0, value) : 0)
         return String(format: "%d:%02d:%02d", seconds / 3600, (seconds / 60) % 60, seconds % 60)
-    }
-}
-
-struct SettingsView: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var server = SecureSettings.read("server")
-    @State private var token = SecureSettings.read("token")
-    @State private var status = ""
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Plex setup • next milestone") {
-                    Text("These settings are stored privately on this iPhone. This starter does not yet connect to Plex.")
-                    TextField("HTTPS server address", text: $server).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                    SecureField("Plex token", text: $token).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    Button("Save on this iPhone") {
-                        guard server.isEmpty || validServer(server) else { status = "Enter an HTTPS server address without a username, password, query, or fragment."; return }
-                        do {
-                            try SecureSettings.write(server, key: "server")
-                            try SecureSettings.write(token, key: "token")
-                            status = "Saved in this iPhone’s Keychain."
-                        } catch { status = "Settings could not be fully saved. Please retry." }
-                    }
-                    Button("Clear saved connection", role: .destructive) {
-                        do {
-                            try SecureSettings.write("", key: "server")
-                            try SecureSettings.write("", key: "token")
-                            server = ""; token = ""; status = "Connection settings cleared."
-                        } catch { status = "Could not clear all settings. Please retry." }
-                    }
-                    if !status.isEmpty { Text(status).font(.caption) }
-                }
-                Section("About this starter") {
-                    Text("Version 0.1 • Offline playback prototype")
-                    Text("No analytics, advertising, or network requests. Books and progress are stored locally and excluded from device backup. Do not uninstall the app to refresh signing: uninstalling removes local books and progress.")
-                    Text("Free sideloaded installations need their signing refreshed every seven days. An expired app cannot open, including for offline listening.")
-                }
-            }.navigationTitle("Settings")
-                .toolbar { Button("Done") { dismiss() } }
-        }
-    }
-    private func validServer(_ text: String) -> Bool {
-        guard let url = URLComponents(string: text), url.scheme == "https", let host = url.host, !host.isEmpty else { return false }
-        return url.user == nil && url.password == nil && url.query == nil && url.fragment == nil
     }
 }

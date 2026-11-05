@@ -1,72 +1,58 @@
-# BookHarbor — native iPhone audiobook starter
+# BookHarbor
 
-Version 0.1 is an offline playback prototype, not a finished Plex client.
+Native iPhone audiobook player for Plex, iOS 17+. Public source; private connection and library data belong only on the iPhone. No Pi or original media changes.
 
-## Included
+## Status
 
-- SwiftUI iPhone app, iOS 17 or later.
-- Import unprotected M4B, M4A, MP3, AAC, or WAV files from the Files picker.
-- Local copies retained in Application Support, not disposable browser storage.
-- Resume position saved every five seconds and on pause/background transitions.
-- Playback speed, 15-second rewind, 30-second forward, and sleep timer.
-- Background audio configuration, lock-screen metadata and remote play/pause/skip controls.
-- Pause when the output device disconnects or an audio interruption begins.
-- Private Keychain fields for future Plex integration. No network requests yet.
-- Unsigned device IPA build workflow for local signing with Sideloadly.
-- Source and Git history privacy checks.
+The previous version built an unsigned IPA and installed with Sideloadly. MP3 import, playback, and locked-iPhone playback were verified on a real iPhone by the owner. Version 0.2 adds a Plex preview; its compile/test status is tracked below. New Plex, download, chapter, Bluetooth, renewal, and migration behavior needs real-iPhone acceptance testing. Compilation is not device validation.
 
-## Not implemented yet
+## Implemented in the Plex preview
 
-Plex authentication/linking, server discovery, browsing, streaming, downloads from Plex,
-download progress/resume, artwork, embedded chapters, bookmarks, multipart books, and
-Plex position synchronization. The current Import button copies an existing file into
-the app; it is not a Plex download button. HTTPS-only settings are a placeholder;
-local-network/VPN connection policy needs to be designed before Plex integration.
+- Browser-based Plex PIN account linking; no manually copied token or password field. Tokens and validated server connections use device-only Keychain storage. Sign-out cancels transfers, clears saved Plex credentials, and retains completed audio and progress. Revoke the authorized device in Plex to revoke server-side access.
+- Authorized server discovery with HTTPS only, local secure connections preferred, relay last. Server identity checked against discovery. No TLS bypass or insecure-network exception. HTTP-only servers cannot connect. Expired/revoked access and unreachable servers show retry/link guidance.
+- Paged music-library albums as books, with author and optional cached artwork. Track ordering uses disc number then track number. Single-track M4B albums and multi-track albums are supported; libraries must have correct album/disc/track tags. Arbitrary audiobook agents and non-music libraries are not supported yet. We have not inspected private server metadata.
+- Direct original MP3/M4A/M4B/MP4/AAC/WAV audio; no transcoding load added. Streaming uses AVPlayer with a custom resource loader and authenticated bounded HTTPS range requests. Servers must support byte ranges. All redirects and absolute server-supplied media URLs are rejected. Incompatible codecs/DRM can still fail playback.
+- Independent book progress keyed by server machine identity plus Plex album rating key, unaffected by local title edits. File identity/index, precise offset, chapter ID and update time persist locally; intentional rewinds win. Checkpoints every five seconds and on pause/app background. Abrupt termination can lose up to the checkpoint interval. Plex database rebuilds that change rating keys cannot be automatically reconciled.
+- Continue Listening with multiple books, mark finished/unfinished, explicit restart. No server progress synchronization: older server state cannot overwrite offline listening.
+- Persistent background URLSession downloads, progress, pause/cancel/retry, system resume data where usable, ordered multipart completion, HTTP/MIME/size/audio validation and storage headroom checks. Each part commits independently; a book is offline only after every part completes. A non-resumable or changed-credential retry restarts the affected part. iOS controls background scheduling; force-quitting prevents background relaunch until manually reopened.
+- Offline books use persistent Application Support storage and require no Plex login. Local audio deletion retains Plex metadata/progress. Long-press shelf books for actions. Storage total includes validated partial tracks. Imported books retain the previous index, UUIDs, filenames and positions; deleting an imported book explicitly deletes its progress.
+- Plex chapters plus AVFoundation embedded chapters, with chapter titles/start/end, durations, current chapter and tap-to-jump. File boundaries have a separate ordered track list. Missing chapter data never blocks audio. Embedded chapters are read when a file is opened; cached chapter metadata is available offline. No external or invented chapter timings.
+- Existing speed, sleep timer, audio session, lock-screen controls and disconnect/interruption handling retained. No dedicated CarPlay interface or entitlement.
 
-## Validation status
+## Validation
 
-Source and configuration reviewed in a Linux environment; privacy checks run locally.
-No Xcode compiler or iPhone was available. First successful GitHub Actions build and
-real-device acceptance tests are required. Do not assume compilation or sideloading
-has already succeeded. Large-file import currently copies synchronously and may pause
-the UI; a coordinated background import is a follow-up before production use.
+Pending the first version 0.2 macOS run. Synthetic XCTest coverage includes Plex parsing/order, malformed chapter timing, multipart navigation, URL/authentication policy, redirect rejection, HTTP/size/MIME completion failures, legacy-index migration, Keychain roundtrip and two independent book positions after relaunch (including rewind, metadata edit, and download-state changes).
 
-## Windows setup
+Tests do not substitute for real background transfers, embedded chapter extraction across formats, TLS/server compatibility or iPhone audio routing. No private credentials, media or library fixtures are used in CI. The standard macOS runner builds an unsigned device IPA after simulator tests; artifact retention is one day. No paid service or Apple membership is required by the build.
 
-See WINDOWS_SETUP.md. Public source is authorized for this project, but this ZIP has
-not been published and no GitHub account was accessed. Use a new empty repository;
-do not upload your existing Pi workspace. No Apple signing credentials belong in CI.
+## Install / update on Windows
 
-## First device acceptance test
+Use GitHub CLI in PowerShell (artifact expires after one day):
 
-1. Install the unsigned IPA through Sideloadly using a free Apple account.
-2. Import a short, unprotected audio file. Verify play, pause, skips, speed and timer.
-3. Pause midway, close/relaunch the app and verify resume position.
-4. Enable airplane mode and verify local playback; re-enable Bluetooth if needed.
-5. Lock the phone and verify uninterrupted audio and lock-screen controls.
-6. Connect AirPods or car Bluetooth. Check sound and supported accessory buttons.
-7. Disconnect the headphones and confirm playback pauses instead of playing aloud.
-8. Receive a call and confirm playback pauses. Resume manually afterward.
-9. Refresh signing using the same Apple account and bundle identifier without
-   uninstalling; verify the local book and position remain intact.
-10. Test a multi-hour M4B for seeking, storage and reliable long playback.
+```powershell
+$runId = gh run list --repo danielmichlin-dev/bookharbor --workflow build.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId'
+gh run download $runId --repo danielmichlin-dev/bookharbor --name BookHarbor-unsigned --dir .\build\latest-ipa
+```
 
-No dedicated CarPlay interface or entitlement is included. Car Bluetooth is the
-initial car-listening target. Any CarPlay Now Playing behavior needs device testing.
-Signing expiry prevents the app from opening even when all media is offline.
+Open `build\latest-ipa\BookHarbor-unsigned.ipa` in Sideloadly. Connect and trust the iPhone. Use the **same Apple Account and the same Sideloadly app/bundle identifier used for the installed copy**, and install over it. Source bundle identity remains `org.example.bookharbor`; preserve any identifier Sideloadly previously assigned. **Do not uninstall.** Verify the existing imported file and progress afterward. Free signing needs periodic renewal (normally seven days); an expired app cannot open even with offline media. See WINDOWS_SETUP.md for initial setup.
 
-## Next milestones
+## Real-iPhone checklist
 
-1. Prove build, installation, offline audio, background behavior and refresh persistence.
-2. Plex link/login on the device; browse one selected audiobook library. Never embed a token.
-3. Stream and download original compatible media; add retry, cancellation, validation,
-   storage management and reliable background transfers. Avoid transcoding by default.
-4. Chapters, artwork, bookmarks, multipart ordering, and local/Plex progress conflicts.
+1. Before updating, note two existing positions privately. Update without uninstalling; verify imported audio, both positions and Continue Listening.
+2. Link in Plex browser, return to BookHarbor, discover/select server and audiobook music library. Browse multiple pages; check book grouping, author, cover and disc/track order. Do not send private connection data to chat or issues.
+3. Stream a single M4B and a multi-track MP3 book. Check seeking across files, speed and timer. Check Plex/embedded chapter titles, durations, current chapter and jump. With no chapters, verify the track list and audio still work.
+4. Switch A to B, intentionally rewind A, quit/relaunch and reboot. Restore both positions within the checkpoint interval, including a position inside a chapter. Download A and confirm progress is unchanged when opening its local copy.
+5. Download with the phone locked; background and reopen during transfer. Pause/resume, cancel/retry, interrupt Wi-Fi and test authorization failure. No error or partial book should show Offline. Check storage reporting and local deletion.
+6. Complete all parts, sign out, enable airplane mode, relaunch and play all tracks. Verify cached artwork/chapters and progress with no fresh login.
+7. Check locked-screen audio and play/pause/skip, AirPods/car Bluetooth, disconnect pause, call interruption and manual resume. Refresh signing again without uninstalling and check data remains.
+8. Mark finished/unfinished; confirm position stays until explicit Restart. Check Restart returns to the first file and beginning.
 
-## Technical references
+## Deferred
 
-- https://developer.apple.com/documentation/avfaudio/avaudiosession
-- https://developer.plex.tv/pms/
-- https://github.com/yonaskolb/XcodeGen
-- https://sideloadly.io/faq.html
-- https://docs.github.com/en/billing/concepts/product-billing/github-actions
+Plex progress sync, automatic reconnection/failover during a stream, transcoding, bookmarks, external metadata search/candidate selection, manual metadata/cover editing, and external edition-matched chapter lookup. See METADATA_PLAN.md for provider research and privacy rules. No metadata provider requests are currently made. Large Files imports still copy synchronously as in the verified starter.
+
+## References
+
+- Plex API/authentication: https://developer.plex.tv/pms/
+- Apple background transfers: https://developer.apple.com/documentation/foundation/downloading-files-in-the-background
+- Sideloadly FAQ: https://sideloadly.io/faq.html

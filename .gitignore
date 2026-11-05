@@ -19,3 +19,4 @@ DerivedData/
 Generated/
 *.xcodeproj/
 __pycache__/
+build-tests/

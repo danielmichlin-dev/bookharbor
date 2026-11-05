@@ -15,7 +15,7 @@ RULES = {
     'email address': re.compile(r'\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b'),
 }
 ALLOWED = {'.swift', '.md', '.py', '.yml', '.yaml', '.ps1'}
-SKIP = {'.git', '__pycache__', 'build', 'DerivedData', 'Generated', 'private'}
+SKIP = {'.git', '__pycache__', 'build', 'build-tests', 'DerivedData', 'Generated', 'private'}
 
 def inspect(label, data):
     errors = []

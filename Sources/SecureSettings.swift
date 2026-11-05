@@ -29,4 +29,16 @@ enum SecureSettings {
         guard status == errSecSuccess else { throw SaveError.failed }
     }
     enum SaveError: Error { case failed }
+    static func clearPlex() throws {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service, kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw SaveError.failed }
+        for item in result as? [[String: Any]] ?? [] {
+            if let key = item[kSecAttrAccount as String] as? String,
+               key.hasPrefix("plex-") || ["server", "token"].contains(key) { try write("", key: key) }
+        }
+    }
 }
