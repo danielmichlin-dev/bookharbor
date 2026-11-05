@@ -22,6 +22,8 @@ targets:
       path: Generated/Info.plist
       properties:
         CFBundleDisplayName: BookHarbor
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
         NSLocalNetworkUsageDescription: Connect to your audiobook server on your home network.
