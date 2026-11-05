@@ -3,6 +3,14 @@ import AVFoundation
 @testable import BookHarbor
 
 final class BookHarborTests: XCTestCase {
+    func testPaginationAndUnpaginatedLargeResponse() throws {
+        let unpaged = try JSONDecoder().decode(PlexEnvelope.self, from: Data(#"{"MediaContainer":{"size":80}}"#.utf8)).MediaContainer
+        XCTAssertFalse(unpaged.hasMore(after: 80, returnedCount: 80))
+        let paged = try JSONDecoder().decode(PlexEnvelope.self, from: Data(#"{"MediaContainer":{"offset":0,"size":50,"totalSize":80}}"#.utf8)).MediaContainer
+        XCTAssertTrue(paged.hasMore(after: 50, returnedCount: 50))
+        XCTAssertFalse(paged.hasMore(after: 80, returnedCount: 30))
+        XCTAssertFalse(paged.hasMore(after: 50, returnedCount: 0))
+    }
     func testEmbeddedChapterGroupsPreserveTitleAndExactTimes() async {
         let title = AVMutableMetadataItem()
         title.identifier = .commonIdentifierTitle

@@ -50,6 +50,11 @@ struct PlexContainer: Decodable {
     var totalSize: Int?
     var Metadata: [PlexMetadata]?
     var Directory: [PlexDirectory]?
+    func hasMore(after end: Int, returnedCount: Int) -> Bool {
+        guard returnedCount > 0 else { return false }
+        if let totalSize { return end < totalSize }
+        return offset != nil && returnedCount >= 50
+    }
 }
 struct PlexDirectory: Decodable, Identifiable {
     let key: String

@@ -173,7 +173,7 @@ final class PlexTransport {
             guard page.offset == nil || page.offset == offset else { throw PlexError.malformed }
             let fresh = entries.filter { item in !albums.contains(where: { $0.id == item.id }) }
             albums += fresh; offset += entries.count
-            hasMore = !fresh.isEmpty && offset < (page.totalSize ?? (entries.count >= 50 ? Int.max : offset))
+            hasMore = !fresh.isEmpty && page.hasMore(after: offset, returnedCount: entries.count)
             status = "\(albums.count) books loaded. Books are Plex albums; disc and track numbers determine playback order."
         } catch { report(error) }
     }
@@ -188,7 +188,7 @@ final class PlexTransport {
             guard page.offset == nil || page.offset == start else { throw PlexError.malformed }
             guard !entries.contains(where: { entry in all.contains(where: { $0.id == entry.id }) }) else { throw PlexError.malformed }
             all += entries; start += entries.count
-            if entries.isEmpty || start >= (page.totalSize ?? (entries.count < 50 ? start : Int.max)) { break }
+            if !page.hasMore(after: start, returnedCount: entries.count) { break }
             guard start < 100_000 else { throw PlexError.malformed }
         }
         let tracks = try PlexBooks.tracks(all)
@@ -214,8 +214,11 @@ final class PlexTransport {
         request.url = url.url
         request.setValue(String(start), forHTTPHeaderField: "X-Plex-Container-Start")
         request.setValue("50", forHTTPHeaderField: "X-Plex-Container-Size")
-        let (data, _) = try await PlexTransport.shared.data(request)
-        return try JSONDecoder().decode(PlexEnvelope.self, from: data).MediaContainer
+        let (data, response) = try await PlexTransport.shared.data(request)
+        var page = try JSONDecoder().decode(PlexEnvelope.self, from: data).MediaContainer
+        if page.offset == nil { page.offset = response.value(forHTTPHeaderField: "X-Plex-Container-Start").flatMap(Int.init) }
+        if page.totalSize == nil { page.totalSize = response.value(forHTTPHeaderField: "X-Plex-Container-Total-Size").flatMap(Int.init) }
+        return page
     }
     func signOut() throws {
         cancelLink(); generation = UUID()
