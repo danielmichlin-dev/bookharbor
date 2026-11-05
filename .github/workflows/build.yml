@@ -1,0 +1,37 @@
+name: Build iPhone starter
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: iphone-build
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check source and history for private data
+        run: python3 scripts/privacy_check.py --history
+      - name: Install project generator
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Compile unsigned device app
+        run: xcodebuild -project BookHarbor.xcodeproj -scheme BookHarbor -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: Package for local signing
+        run: |
+          mkdir -p build/package/Payload
+          cp -R build/Build/Products/Release-iphoneos/BookHarbor.app build/package/Payload/
+          cd build/package
+          zip -qr ../BookHarbor-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BookHarbor-unsigned
+          path: build/BookHarbor-unsigned.ipa
+          retention-days: 1
